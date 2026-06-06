@@ -8,7 +8,9 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-teal.svg)](LICENSE)
   [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-emerald.svg)](CONTRIBUTING.md)
   [![Support Development](https://img.shields.io/badge/Donate-Buy%20Me%20A%20Coffee-orange.svg)](https://buymeacoffee.com/rorrimaesu)
-  [![Live Beta](https://img.shields.io/badge/Beta-Live-blue.svg)](https://wevote-5400a.firebaseapp.com)
+  [![Live Beta](https://img.shields.io/badge/Beta-Live-blue.svg)](https://wevote-5400a.web.app/)
+
+  **Live Application:** [wevote-5400a.web.app](https://wevote-5400a.web.app/)
 </div>
 
 ---
