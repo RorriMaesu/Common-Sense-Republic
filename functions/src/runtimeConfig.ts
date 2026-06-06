@@ -9,7 +9,7 @@ function loadDotEnvIfPresent() {
   if (_envLoaded) return;
   _envLoaded = true;
   // If key already present, skip (could be provided via deploy-time vars or functions.config())
-  if (process.env.GEMINI_API_KEY || process.env.RECEIPTS_SECRET || process.env.KMS_KEY_PATH) return;
+  if (process.env.RECEIPTS_SECRET || process.env.KMS_KEY_PATH) return;
   // Prefer a .env inside functions/ for clarity; fall back to repo root .env if found.
   const candidatePaths = [
     path.join(__dirname, '..', '.env'),              // functions/.env (after build __dirname -> lib/)
@@ -35,8 +35,6 @@ function loadDotEnvIfPresent() {
 // Keeping a single resolution point reduces drift and simplifies future Secret Manager migration.
 
 export interface RuntimeConfig {
-  geminiApiKey?: string;
-  skipLLM: boolean;
   receiptsSecret?: string;
   kmsKeyPath?: string;
 }
@@ -48,11 +46,9 @@ export function loadRuntimeConfig(): RuntimeConfig {
   // Ensure we attempt local .env load before reading process.env
   loadDotEnvIfPresent();
   const fc = safeFunctionsConfig();
-  const geminiApiKey = process.env.GEMINI_API_KEY || fc.gemini?.key;
-  const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || fc.test?.skipllm === true;
   const receiptsSecret = process.env.RECEIPTS_SECRET || fc.receipts?.secret;
   const kmsKeyPath = process.env.KMS_KEY_PATH || fc.kms?.keypath;
-  _cached = { geminiApiKey, skipLLM, receiptsSecret, kmsKeyPath };
+  _cached = { receiptsSecret, kmsKeyPath };
   return _cached;
 }
 
@@ -62,12 +58,6 @@ function safeFunctionsConfig(): any {
   } catch {
     return {};
   }
-}
-
-// Convenience helpers (optional granularity)
-export function getGeminiSettings() {
-  const { geminiApiKey, skipLLM } = loadRuntimeConfig();
-  return { geminiApiKey, skipLLM };
 }
 
 export function getReceiptSecret(): string | undefined {
