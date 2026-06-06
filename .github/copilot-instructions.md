@@ -1,4 +1,4 @@
-## WeVote Monorepo – AI Agent Guide
+## Common Sense Republic Monorepo – AI Agent Guide
 
 Actionable, project-specific rules. Prefer making the change directly over generic advice. Keep invariants intact.
 
@@ -25,7 +25,7 @@ Actionable, project-specific rules. Prefer making the change directly over gener
 - Reuse existing helpers; if adding a new domain create a helper using same pattern (`rate_limits` doc id prefix + sliding window).
 
 ### 5. Receipts, Signing & Ledger
-- Vote receipt: HMAC-SHA256(secret) over canonical JSON `{ ballotId, voter, vote, ts }`, truncate hex to 32 chars → `receiptHash`; surface short code (`WeVote-RECEIPT-<first8>`).
+- Vote receipt: HMAC-SHA256(secret) over canonical JSON `{ ballotId, voter, vote, ts }`, truncate hex to 32 chars → `receiptHash`; surface short code (`CSR-RECEIPT-<first8>`).
 - KMS optional: `kmsSign` attempts ECDSA P‑256 over canonical (ballots, votes, tally, ledger). Failures are swallowed silently; never hard fail solely on missing signature.
 - Ledger entries built via `buildCanonical(seq, prevHash, dataPayload)`; store returned `canonical` verbatim. Hash chain integrity depends on stable JSON stringify ordering (default Node ordering of inserted keys—do NOT reorder manually).
 
