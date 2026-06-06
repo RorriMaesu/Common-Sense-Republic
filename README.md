@@ -186,6 +186,14 @@ To view detailed server errors, check the Firebase Console -> Functions -> Logs.
 
 ---
 
+## ☕ Support the Project
+
+If you believe in direct digital democracy and want to help support our hosting and API model costs, consider buying us a coffee!
+
+<a href="https://buymeacoffee.com/rorrimaesu" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
+---
+
 <div align="center">
   <sub>Built with ❤️ by the Common Sense Republic Community. Let's make democracy transparent.</sub>
 </div>
