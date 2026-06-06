@@ -13,7 +13,9 @@ module.exports = {
           navy: '#0B2545',
           sky: '#0E5C7B',
           teal: '#00C2A8',
-          amber: '#FFB547'
+          amber: '#FFB547',
+          red: '#D92D20',
+          gold: '#F59E0B',
         }
       },
       borderRadius: {

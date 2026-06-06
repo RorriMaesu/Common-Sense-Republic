@@ -1,4 +1,4 @@
-Nice — **WeVote** it is. I thought *very* long and built a single, comprehensive, production-ready webapp design document you can hand to designers and engineers and start building from day one.
+Nice — **Common Sense Republic** it is. I thought *very* long and built a single, comprehensive, production-ready webapp design document you can hand to designers and engineers and start building from day one.
 
 This document contains:
 
@@ -19,13 +19,13 @@ I’ve aimed for actionable specificity so your engineers can start implementing
 
 ---
 
-# WeVote — Comprehensive Webapp Design Document
+# Common Sense Republic — Comprehensive Webapp Design Document
 
 > Revision Note (2025-09-29): This document was updated to reflect newly implemented components: hardened concern chat assistant (rolling summaries, action allowlist, moderation heuristics), prompt library export & version hashing, append-only transparency ledger, deterministic RCV improvements (exhausted count + tie-break), server-enforced append-only provenance arrays, and deployment nuances (callable + HTTP twins). Original sections retained; deltas annotated where relevant.
 
 ## 1. Vision & Product Principles
 
-**Vision:** WeVote — a trustworthy, auditable public square where people draft, debate, and vote on policy proposals that can be refined into well-sourced bill drafts and exported to decision-makers.
+**Vision:** Common Sense Republic — a trustworthy, auditable public square where people draft, debate, and vote on policy proposals that can be refined into well-sourced bill drafts and exported to decision-makers.
 
 **Core principles**
 
@@ -89,7 +89,7 @@ Map features to tiers in the security rules (see Firestore rules section).
 
 ### Global layout & nav
 
-* Top nav (desktop): Logo (WeVote) | Search bar | Create Concern (primary CTA) | Notifications | Profile menu
+* Top nav (desktop): Logo (Common Sense Republic) | Search bar | Create Concern (primary CTA) | Notifications | Profile menu
 * Left rail (desktop): Filters: Jurisdiction, Topics, Nearby, Following
 * Right rail (desktop): Transparency widget (latest audits), Assistant quick actions
 * Mobile: bottom nav with Home / Create / Ballots / Transparency / Profile
@@ -98,9 +98,9 @@ Map features to tiers in the security rules (see Firestore rules section).
 
 ### Landing page (unauthenticated)
 
-Hero: “WeVote — Draft. Debate. Decide.”
+Hero: “Common Sense Republic — Draft. Debate. Decide.”
 CTA buttons: [Get Started] (signup) [Explore Feed] (read-only)
-Secondary: “How WeVote works” with 3-step explainer cards: Chat → Draft → Vote
+Secondary: “How Common Sense Republic works” with 3-step explainer cards: Chat → Draft → Vote
 Footer: Transparency link, Governance charter, Privacy policy
 
 ---
@@ -226,7 +226,7 @@ Microcopy:
 
 **Receipt & audit**
 
-* Receipt format: `WeVote-RECEIPT-{shortHash}` and downloadable JSON with `receiptHash`, `ballotId`, `voterSignaturePublicKey`, `timestamp`.
+* Receipt format: `CSR-RECEIPT-{shortHash}` and downloadable JSON with `receiptHash`, `ballotId`, `voterSignaturePublicKey`, `timestamp`.
 * Public audit page: anonymized tallies + proof data.
 
 Microcopy:
@@ -587,7 +587,7 @@ service cloud.firestore {
 **Flash-Lite: Generate 3 short policy options (system prompt) – Draft Options v1**
 
 ```
-SYSTEM: You are WeVote Assistant. For a user-submitted civic concern, produce three short policy options (A, B, C). Each option should be 1-3 sentences, neutral, and include one quick pros/cons line. Do NOT invent legal statutes. If you reference a fact, mark as [NEEDS_SOURCE].
+SYSTEM: You are Board of Common Sense Civic Policy Assistant. For a user-submitted civic concern, produce three short policy options (A, B, C). Each option should be 1-3 sentences, neutral, and include one quick pros/cons line. Do NOT invent legal statutes. If you reference a fact, mark as [NEEDS_SOURCE].
 USER: Concern: "{concern_text}"
 RESPONSE FORMAT (JSON):
 {
@@ -601,7 +601,7 @@ RESPONSE FORMAT (JSON):
 **Gemini Pro: Formal bill draft (system prompt) – (Planned) Draft Pro v1**
 
 ```
-SYSTEM: You are WeVote Legislative Drafter (Gemini Pro). Using the retrieval results (documents listed below) and the user's remit (jurisdiction {jurisdiction}), generate a draft bill with sections: Preamble, Definitions, Main Provisions, Enforcement, Funding/Budget estimate (if applicable), Sunset clause, and Implementation Timeline. Cite sources inline in brackets: [source-id]. If you cannot verify a claim, state explicitly "UNVERIFIED" and do not assert it as fact. Limit hallucinations.
+SYSTEM: You are Board of Common Sense Legislative Drafter (Gemini Pro). Using the retrieval results (documents listed below) and the user's remit (jurisdiction {jurisdiction}), generate a draft bill with sections: Preamble, Definitions, Main Provisions, Enforcement, Funding/Budget estimate (if applicable), Sunset clause, and Implementation Timeline. Cite sources inline in brackets: [source-id]. If you cannot verify a claim, state explicitly "UNVERIFIED" and do not assert it as fact. Limit hallucinations.
 USER: Draft request: {concern_title} — {short_summary}
 RETRIEVALS: {list of doc ids + snippets}
 OUTPUT: Markdown with headings and a JSON `provenance` object.
@@ -898,7 +898,7 @@ app.post('/tally', async (req,res) => {
 
 ```json
 {
-  "system": "You are WeVote assistant. Create 3 short policy options...",
+  "system": "You are Board of Common Sense Civic Policy Assistant. Create 3 short policy options...",
   "user": "Concern: Street parking in X has too little turnover during lunch hours..."
 }
 ```
@@ -907,7 +907,7 @@ app.post('/tally', async (req,res) => {
 
 ```json
 {
-  "system": "You are WeVote Legislative Drafter (Gemini Pro). Using these retrieved docs...",
+  "system": "You are Board of Common Sense Legislative Drafter (Gemini Pro). Using these retrieved docs...",
   "user": "Please draft a municipal ordinance for dynamic lunchtime parking fees..."
 }
 ```
@@ -933,7 +933,7 @@ app.post('/tally', async (req,res) => {
 * Exhausted ballots: 112
 * Rounds: Round 1 counts -> Round 2 transfers...
 * TallyHash: `sha256:...` signed: `kms-sig-b64`
-* Receipt sample: `WeVote-RECEIPT-abc123`
+* Receipt sample: `CSR-RECEIPT-abc123`
 * Published artifacts: `exports/ballot_123_tally.json` (downloadable)
 
 ---

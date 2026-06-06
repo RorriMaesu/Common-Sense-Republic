@@ -1,14 +1,16 @@
-# WeVote Monorepo
+# Common Sense Republic (CSR)
 
-Trusted civic drafting, discussion, and voting platform with verifiable tallies, cryptographic receipts, transparent LLM prompt provenance, and hardened assistant workflows.
+### A Decentralized, Direct Digital Democracy Platform Built to Replace Politicians with Transparent, Auditable, and Locally-Run/Verified AI.
 
-> Public Repository: https://github.com/RorriMaesu/WeVote
+Common Sense Republic is a prototype for a direct digital democracy where citizens debate, refine, and vote on legislation directly. By using local and verified AI models to aggregate community concerns, compile robust policy options, draft formal bills, and run secure, verifiable liquid voting (including RCV, approval voting, and cryptographic receipts), CSR aims to build a public square that is fully auditable, highly secure, and immune to political corruption.
+
+> Public Repository: https://github.com/RorriMaesu/Common-Sense-Republic
 
 **Live Beta:** https://wevote-5400a.firebaseapp.com
 
 <div align="center">
 
-[![Support WeVote Development](web/public/support-coffee.svg)](https://buymeacoffee.com/rorrimaesu "Buy Me a Coffee – support hosting & model costs")
+[![Support Common Sense Republic Development](web/public/support-coffee.svg)](https://buymeacoffee.com/rorrimaesu "Buy Me a Coffee – support hosting & model costs")
 
 </div>
 
@@ -27,12 +29,14 @@ If you're reading this from a local clone acquired elsewhere, please pull update
 |--------|--------|-------|
 | Draft Generation (Flash-Lite tier mapping) | ✅ | Caching via `(concernId + promptHash)` prevents duplicates |
 | Voting (simple, approval, RCV) | ✅ | Deterministic tie-break + exhausted count tracking |
-| Vote Receipts | ✅ | HMAC-SHA256 truncated to 32 hex + short code `WeVote-RECEIPT-<first8>` |
+| Vote Receipts | ✅ | HMAC-SHA256 truncated to 32 hex + short code `CSR-RECEIPT-<first8>` |
 | Transparency Ledger | ✅ | Append-only hash chain (`transparency_ledger`) with optional KMS signature |
 | Prompt Library Export | ✅ | Callable + HTTP twin enumerating prompt versions + hashes |
 | Receipt Verification | ✅ | `verifyReceipt` callable + HTTP returns non-identifying vote proof |
 | Public Audit Mirror | ✅ | `audit_public` sanitized tally+rounds mirror |
 | Chat Assistant (Concern Chat + Rolling Summary) | ✅ | Injection guard, JSON action allowlist, moderation heuristics, rate limits |
+| Concern Readiness Scoring | ✅ | Composite (drafts, expert review, citations, distinctiveness, structure) callable+HTTP |
+| Structured Concern Fields (objectives / constraints / open questions) | ✅ | Creator/admin gated update function + normalization |
 | Rate Limits | ✅ | Drafts (10/hr/user), Ballot creation (3/6h/user), Vote updates (10/hr/user+ballot), Chat msgs (config) |
 | Edit History / Citations Append Functions | ✅ | Append-only via server; client cannot mutate arrays directly |
 | Delegation Scaffold | ✅ (basic) | Data structure + setter; no weighted tally integration yet |
@@ -60,6 +64,8 @@ Implemented pairs follow naming `<name>` and `<name>Http` for fallback when call
 - `submitDraftReview` / `submitDraftReviewHttp`
 - `setDelegation` / `setDelegationHttp`
 - `verifyReceipt` / `verifyReceiptHttp`
+- `concernReadiness` / `concernReadinessHttp`
+- `updateConcernStructure` / `updateConcernStructureHttp`
 
 Callable-only (no direct public HTTP twin) where appropriate: `tallyBallot`, `setUserTier` (admin), `listLedgerEntries`.
 
@@ -101,7 +107,7 @@ Verification (client): sequential fetch ordered by `seq`, re-hash each `canonica
 
 ## Cryptographic Vote Receipts
 
-Canonical receipt payload JSON shape: `{ ballotId, voter, vote, ts }` → HMAC-SHA256(secret) → hex truncated 32 chars = `receiptHash`; user-facing code `WeVote-RECEIPT-<first8>`. Deterministic for identical canonical values (replay safe because timestamp included).
+Canonical receipt payload JSON shape: `{ ballotId, voter, vote, ts }` → HMAC-SHA256(secret) → hex truncated 32 chars = `receiptHash`; user-facing code `CSR-RECEIPT-<first8>`. Deterministic for identical canonical values (replay safe because timestamp included).
 
 ## Prompt Library & Version Transparency
 
@@ -118,7 +124,9 @@ Key enforced invariants (rules + server logic):
 
 ## Testing
 
-Jest tests (in `functions/test`) cover: tally determinism, rate limits, immutability guards, prompt library integrity, moderation heuristics, action parsing, summary compression.
+Jest tests (in `functions/test`) cover: tally determinism, rate limits, immutability guards, prompt library integrity, moderation heuristics, action parsing, summary compression, readiness scoring, concern structure normalization, delegation, ledger chain integrity.
+
+Current count: 26 suites / 62 tests (will grow as features expand).
 
 Run all tests:
 ```bash
@@ -334,6 +342,23 @@ Verification steps (client):
 If any link or hash fails, mark chain invalid. The `/verify` page provides an in-browser verifier prototype.
 
 ### Exporting the Public Key
+## Concern Readiness & Structured Fields
+
+Readiness scoring (`concernReadiness` / `concernReadinessHttp`) returns:
+```
+{ ok: true, concernId, score: 0-100, components: { drafts, expert, citations, distinct, summary }, missing: string[], recommendations: string[], version }
+```
+Weights (v1): drafts 30, expert 30, citations 15, distinctiveness 20, summary fields 5.
+
+Structured fields are optional but boost readiness and user clarity:
+- `objectives[]` (max 8, 160 chars each)
+- `constraints[]` (max 8, 160 chars each)
+- `openQuestions[]` (max 10, 160 chars each)
+
+Update via callable `updateConcernStructure` (or HTTP twin) – only concern creator or admin. Empty / invalid entries are pruned; if a list becomes empty it’s deleted to avoid stale empty arrays.
+
+Frontend displays provenance badges per draft: model name (or Fallback) + short `promptHash`/`responseHash` fragments to support trust & diffing.
+
 ```
 gcloud kms keys versions get-public-key 1 \
 	--location=global --keyring=wevote-core --key=wevote-signing \

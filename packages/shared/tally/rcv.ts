@@ -24,11 +24,22 @@ export function tallyRCV(ballots: RCVBallot[]): RCVOutcome {
       rounds.push({ round, counts, exhausted });
       return { rounds, winner: sorted[0][0], exhausted };
     }
-    // eliminate lowest (tie => lexicographically last)
+    // eliminate lowest (tie => deterministic hash-based stable tie breaker)
     const lowestCount = Math.min(...Object.values(counts));
     const lowestCandidates = Object.entries(counts).filter(([,c])=>c===lowestCount).map(([c])=>c);
-    lowestCandidates.sort();
-    const eliminated = lowestCandidates[lowestCandidates.length-1];
+    
+    // Deterministic selection based on candidate name hashing to prevent name-ordering bias
+    const hashString = (str: string) => {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        hash = (hash << 5) - hash + str.charCodeAt(i);
+        hash |= 0;
+      }
+      return hash;
+    };
+    
+    lowestCandidates.sort((a, b) => hashString(a) - hashString(b));
+    const eliminated = lowestCandidates[lowestCandidates.length - 1];
     active.delete(eliminated);
   rounds.push({ round, counts, eliminated, exhausted });
     if (active.size === 1) {

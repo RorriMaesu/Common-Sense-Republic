@@ -6,12 +6,19 @@ import { createHash, createHmac } from 'crypto';
 // Local RCV tally logic (vendored to avoid packaging complexity)
 import { tallyRCV } from './rcv';
 import { logEvent, kmsSign } from './audit';
+import { getGeminiSettings, getReceiptSecret } from './runtimeConfig';
 import { buildDraftOptionsPrompt, buildConcernChatPrompt, buildConcernSummaryPrompt } from './prompts';
 import { listPromptLibrary } from './prompts';
 import { moderateAssistantReply } from './moderation';
 import { partitionForSummary, buildRollingSummary } from './summarizer';
 import { parseActionSuggestions, estimateTokens } from './actions';
 import { buildCanonical } from './ledger';
+import { evaluateConcernReadiness } from './readiness';
+import { normalizeStringArray } from './concernStructure';
+import { runGeminiRepresentative } from './representative';
+import { runDailyAggregation } from './aggregation';
+import { runAgenticDrafter } from './drafter';
+import { runWeeklyPinning } from './forums';
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -58,7 +65,8 @@ async function applyBallotCreateRateLimit(db: FirebaseFirestore.Firestore, uid: 
 
 // Rate limit vote submissions per ballot per user: max 10 updates per ballot per hour (prevents spam updates)
 async function applyVoteRateLimit(db: FirebaseFirestore.Firestore, uid: string, ballotId: string) {
-  const rlRef = db.collection('rate_limits').doc(`votes_${ballotId}_${uid}`);
+  const voterHash = createHash('sha256').update(uid + ballotId).digest('hex');
+  const rlRef = db.collection('rate_limits').doc(`votes_${voterHash}`);
   await db.runTransaction(async tx => {
     const snap = await tx.get(rlRef);
     const now = Date.now();
@@ -143,15 +151,15 @@ const r = functions.region('us-central1');
 
 // Allowed Gemini model variants (update as Google model catalog evolves)
 const ALLOWED_MODELS = new Set([
-  'gemini-2.5-flash-lite',
+  'gemini-3-flash-preview',
   'gemini-2.5-flash',
   'gemini-2.5-pro'
 ]);
 
 // Map user tier -> default model (cheapest adequate for tier)
 const TIER_DEFAULT_MODEL: Record<string,string> = {
-  basic: 'gemini-2.5-flash-lite',
-  verified: 'gemini-2.5-flash',
+  basic: 'gemini-3-flash-preview',
+  verified: 'gemini-3-flash-preview',
   expert: 'gemini-2.5-pro',
   admin: 'gemini-2.5-pro'
 };
@@ -162,22 +170,30 @@ const ALLOWED_LLM_EMAILS = new Set([
   'nakedsageastrology@gmail.com'
 ]);
 
-function enforceLLMAccess(context: functions.https.CallableContext) {
-  if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in required');
+// Firestore-based dynamic allowlist: if a document exists at llm_access/{uid}, grant access even if email not in static set.
+async function enforceLLMAccess(context: functions.https.CallableContext) {
+  if (!context.auth) { throw new functions.https.HttpsError('unauthenticated','Sign in required'); }
   const email = (context.auth.token.email || '').toLowerCase();
-  if (!ALLOWED_LLM_EMAILS.has(email)) {
-    throw new functions.https.HttpsError('permission-denied','LLM features restricted during development');
-  }
+  if (ALLOWED_LLM_EMAILS.has(email)) { return; } // static allowlist fast path
+  try {
+    const docRef = admin.firestore().collection('llm_access').doc(context.auth.uid);
+    const snap = await docRef.get();
+    if (snap.exists) { return; }
+  } catch { /* ignore; fall through to deny */ }
+  throw new functions.https.HttpsError('permission-denied','LLM features restricted during development');
 }
 
 async function enforceLLMAccessHttp(token: string): Promise<admin.auth.DecodedIdToken> {
   let decoded: admin.auth.DecodedIdToken;
   try { decoded = await admin.auth().verifyIdToken(token); } catch { throw new functions.https.HttpsError('unauthenticated','Invalid token'); }
   const email = (decoded.email || '').toLowerCase();
-  if (!ALLOWED_LLM_EMAILS.has(email)) {
-    throw new functions.https.HttpsError('permission-denied','LLM features restricted during development');
-  }
-  return decoded;
+  if (ALLOWED_LLM_EMAILS.has(email)) { return decoded; }
+  try {
+    const docRef = admin.firestore().collection('llm_access').doc(decoded.uid);
+    const snap = await docRef.get();
+    if (snap.exists) { return decoded; }
+  } catch { /* swallow and deny */ }
+  throw new functions.https.HttpsError('permission-denied','LLM features restricted during development');
 }
 
 export const TIER_ORDER = ['basic','verified','expert','admin'] as const;
@@ -188,44 +204,63 @@ export function tierRank(tier: string | undefined): number {
 
 async function selectModelForUser(uid: string, override?: string): Promise<string> {
   const db = admin.firestore();
-  if (override && ALLOWED_MODELS.has(override)) return override;
+  if (override && ALLOWED_MODELS.has(override)) { return override; }
   try {
     const userSnap = await db.collection('users').doc(uid).get();
     const tier = (userSnap.exists && (userSnap.data() as any).tier) || 'basic';
-    return TIER_DEFAULT_MODEL[tier] || 'gemini-2.5-flash-lite';
+    return TIER_DEFAULT_MODEL[tier] || 'gemini-3-flash-preview';
   } catch {
-    return 'gemini-2.5-flash-lite';
+    return 'gemini-3-flash-preview';
   }
 }
 
-interface GeminiGenResult { text: string; modelName: string; promptHash: string; responseHash: string; parsed: any; raw: string; }
+interface GeminiGenResult { text: string; modelName: string; promptHash: string; responseHash: string; parsed: any; raw: string; fallback: boolean; statusCode: number | null; }
 
 async function runGeminiDrafts(modelName: string, prompt: string, skipLLM: boolean, apiKey: string | undefined): Promise<GeminiGenResult> {
   const promptHash = createHash('sha256').update(prompt).digest('hex');
-  let text: string;
+  let text: string = '';
+  let usedFallback = false;
+  let statusCode: number | null = null; // HTTP status from Gemini (null = no network attempt, 0 = skipped)
   if (skipLLM) {
     text = '{"options":[{"label":"A","text":"Stub option A"},{"label":"B","text":"Stub option B"},{"label":"C","text":"Stub option C"}]}'
+    usedFallback = true;
+    statusCode = 0;
   } else {
-    if (!apiKey) throw new Error('Gemini key not configured');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
-    // Adjust generation config by model family (pro may benefit from higher tokens)
-    const maxOutputTokens = modelName.includes('-pro') ? 1024 : 512;
-    const body = {
-      contents: [ { role: 'user', parts: [{ text: prompt }] } ],
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens,
-        responseMimeType: 'application/json'
+    try {
+  if (!apiKey) { throw new Error('Gemini key not configured'); }
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+      const maxOutputTokens = modelName.includes('-pro') ? 1024 : 512;
+      const body = {
+        contents: [ { role: 'user', parts: [{ text: prompt }] } ],
+        generationConfig: { temperature: 0.7, maxOutputTokens, responseMimeType: 'application/json' }
+      };
+      const rResp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      statusCode = rResp.status;
+      if (!rResp.ok) {
+        const msg = await rResp.text();
+        const status = rResp.status;
+        // Provide structured logging while still falling back gracefully except for misconfiguration
+        console.warn('Gemini draft fetch failed', { status, snippet: msg.slice(0,180) });
+  if (status === 401 || status === 403) { throw new Error(`Gemini auth error ${status}`); }
+  if (status === 429) { throw new Error('Gemini rate limited'); }
+        // Non-fatal fallback for 404/model issues
+        text = '{"options":[{"label":"A","text":"Model unavailable (fallback stub A)"},{"label":"B","text":"Fallback stub B"},{"label":"C","text":"Fallback stub C"}]}'
+        usedFallback = true;
+      } else {
+        const json: any = await rResp.json();
+        const parts = json?.candidates?.[0]?.content?.parts;
+        text = parts?.map((p: any)=> p.text).join('\n') || '';
       }
-    };
-    const rResp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!rResp.ok) {
-      const msg = await rResp.text();
-      throw new Error(`Gemini error: ${msg.slice(0,500)}`);
+    } catch (e:any) {
+      if (e && /Gemini key not configured/.test(e.message || '')) {
+        // Hard failure: configuration issue surfaces clearly to caller
+        throw e;
+      }
+      if (!text) {
+        text = '{"options":[{"label":"A","text":"Temporary service issue (stub)"},{"label":"B","text":"Retry later"},{"label":"C","text":"Reduced mode"}]}'
+        usedFallback = true;
+      }
     }
-    const json: any = await rResp.json();
-    const parts = json?.candidates?.[0]?.content?.parts;
-    text = parts?.map((p: any)=> p.text).join('\n') || '';
   }
   const responseHash = createHash('sha256').update(text).digest('hex');
   let parsed: any = null;
@@ -235,25 +270,54 @@ async function runGeminiDrafts(modelName: string, prompt: string, skipLLM: boole
   if (!parsed?.options || !Array.isArray(parsed.options)) {
     parsed = { options: [ { label: 'A', text: text.slice(0,180) } ] };
   }
-  return { text, modelName, promptHash, responseHash, parsed, raw: text };
+  // Optional invocation logging (only when real model used & not fallback) – minimal metadata only.
+  if (!skipLLM && !usedFallback && (process.env.LOG_LLM_INVOCATIONS === '1')) {
+    try { await admin.firestore().collection('llm_invocations').add({ kind: 'drafts', model: modelName, promptHash, responseHash, ts: Date.now() }); } catch { /* ignore logging errors */ }
+  }
+  return { text, modelName, promptHash, responseHash, parsed, raw: text, fallback: usedFallback, statusCode };
 }
 
 // Generic Gemini JSON or text generation (no enforced schema) for chat/summarization
 async function runGeminiText(modelName: string, prompt: string, skipLLM: boolean, apiKey: string | undefined, expectJson = false) {
   const promptHash = createHash('sha256').update(prompt).digest('hex');
-  let text: string;
+  let text: string = '';
+  let usedFallback = false;
+  let statusCode: number | null = null; // HTTP status or 0 if skipped
   if (skipLLM) {
     text = expectJson ? '{"problem":"stub","context":"stub","objectives":[],"constraints":[],"openQuestions":[]}' : 'Stub response (LLM skipped). Provide more detail about the concern.';
+    usedFallback = true;
+    statusCode = 0;
   } else {
-    if (!apiKey) throw new Error('Gemini key not configured');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
-    const maxOutputTokens = modelName.includes('-pro') ? 1024 : 512;
-    const body = { contents: [ { role: 'user', parts: [{ text: prompt }] } ], generationConfig: { temperature: expectJson ? 0.3 : 0.7, maxOutputTokens, responseMimeType: expectJson ? 'application/json' : 'text/plain' } };
-    const rResp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!rResp.ok) { const msg = await rResp.text(); throw new Error(`Gemini error: ${msg.slice(0,500)}`); }
-    const json: any = await rResp.json();
-    const parts = json?.candidates?.[0]?.content?.parts;
-    text = parts?.map((p: any)=> p.text).join('\n') || '';
+    try {
+  if (!apiKey) { throw new Error('Gemini key not configured'); }
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+      const maxOutputTokens = modelName.includes('-pro') ? 1024 : 512;
+      const body = { contents: [ { role: 'user', parts: [{ text: prompt }] } ], generationConfig: { temperature: expectJson ? 0.3 : 0.7, maxOutputTokens, responseMimeType: expectJson ? 'application/json' : 'text/plain' } };
+      const rResp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      statusCode = rResp.status;
+      if (!rResp.ok) {
+        const msg = await rResp.text();
+        const status = rResp.status;
+        console.warn('Gemini text fetch failed', { status, snippet: msg.slice(0,180) });
+  if (status === 401 || status === 403) { throw new Error(`Gemini auth error ${status}`); }
+  if (status === 429) { throw new Error('Gemini rate limited'); }
+        // Soft fallback for other statuses (404, 500)
+        text = expectJson ? '{"problem":"unavailable","context":"","objectives":[],"constraints":[],"openQuestions":[]}' : 'Assistant temporarily unavailable. Please retry shortly.';
+        usedFallback = true;
+      } else {
+        const json: any = await rResp.json();
+        const parts = json?.candidates?.[0]?.content?.parts;
+        text = parts?.map((p: any)=> p.text).join('\n') || '';
+      }
+    } catch (e:any) {
+      if (e && /Gemini key not configured/.test(e.message || '')) {
+        throw e; // propagate configuration issue
+      }
+      if (!text) {
+        text = expectJson ? '{"problem":"fallback","context":"","objectives":[],"constraints":[],"openQuestions":[]}' : 'Fallback response (LLM unreachable)';
+        usedFallback = true;
+      }
+    }
   }
   const responseHash = createHash('sha256').update(text).digest('hex');
   let parsed: any = null;
@@ -263,12 +327,93 @@ async function runGeminiText(modelName: string, prompt: string, skipLLM: boolean
       parsed = { problem: 'Unparseable', context: '', objectives: [], constraints: [], openQuestions: [] };
     }
   }
-  return { text, promptHash, responseHash, parsed };
+  if (!skipLLM && !usedFallback && (process.env.LOG_LLM_INVOCATIONS === '1')) {
+    try { await admin.firestore().collection('llm_invocations').add({ kind: expectJson ? 'json' : 'text', model: modelName, promptHash, responseHash, ts: Date.now(), statusCode }); } catch {}
+  }
+  return { text, promptHash, responseHash, parsed, fallback: usedFallback, statusCode };
 }
 
 // Simple health check
 export const health = r.https.onRequest((req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// LLM configuration & status diagnostics (no secrets leaked). Callable + HTTP twin for parity.
+export const llmConfigStatus = r.https.onCall(async (_data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in required');
+  const { geminiApiKey, skipLLM } = getGeminiSettings();
+  let source: 'env'|'functions.config'|'missing' = 'missing';
+  if (process.env.GEMINI_API_KEY) source = 'env';
+  else {
+    try { const cfg: any = functions.config(); if (cfg?.gemini?.key) source = 'functions.config'; } catch { /* ignore */ }
+  }
+  return {
+    hasApiKey: !!geminiApiKey,
+    skipLLM,
+    source,
+    allowedEmailsCount: Array.from(ALLOWED_LLM_EMAILS).length,
+    timestamp: Date.now(),
+    version: 1
+  };
+});
+
+export const llmConfigStatusHttp = r.https.onRequest(async (req, res) => {
+  const origin = req.headers.origin || '*';
+  res.set('Access-Control-Allow-Origin', origin);
+  res.set('Vary','Origin');
+  res.set('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods','GET, OPTIONS');
+  res.set('Access-Control-Allow-Credentials','true');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method !== 'GET') { res.status(405).json({ error: 'Method not allowed' }); return; }
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')? authHeader.slice(7): null;
+    if (!token) { res.status(401).json({ error: 'Missing auth token' }); return; }
+    try { await admin.auth().verifyIdToken(token); } catch { res.status(401).json({ error: 'Invalid token' }); return; }
+    const { geminiApiKey, skipLLM } = getGeminiSettings();
+    let source: 'env'|'functions.config'|'missing' = 'missing';
+    if (process.env.GEMINI_API_KEY) source = 'env'; else { try { const cfg: any = functions.config(); if (cfg?.gemini?.key) source = 'functions.config'; } catch {} }
+    res.json({ hasApiKey: !!geminiApiKey, skipLLM, source, allowedEmailsCount: Array.from(ALLOWED_LLM_EMAILS).length, timestamp: Date.now(), version: 1 });
+  } catch (e:any) { res.status(500).json({ error: e.message || 'Internal error' }); }
+});
+
+// Lightweight self-test: performs a minimal real (or skipped) Gemini invocation to verify connectivity & auth.
+// Returns: { ok, model, promptHash, responseHash, fallback, statusCode, skipLLM }
+export const llmSelfTest = r.https.onCall(async (_data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in required');
+  // LLM access gate (reuse same restrictions)
+  await enforceLLMAccess(context);
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+  const modelName = await selectModelForUser(context.auth.uid, 'gemini-3-flash-preview');
+  const prompt = 'Return a short JSON object {"ping":"pong"}';
+  const { text, promptHash, responseHash, fallback, statusCode } = await runGeminiText(modelName, prompt, skipLLM, apiKey, true);
+  let parsed: any = null; try { parsed = JSON.parse(text); } catch { parsed = null; }
+  return { ok: true, model: modelName, promptHash, responseHash, received: parsed, rawLength: text.length, fallback, statusCode, skipLLM };
+});
+
+export const llmSelfTestHttp = r.https.onRequest(async (req, res) => {
+  const origin = req.headers.origin || '*';
+  res.set('Access-Control-Allow-Origin', origin);
+  res.set('Vary','Origin');
+  res.set('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods','GET, OPTIONS');
+  res.set('Access-Control-Allow-Credentials','true');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method !== 'GET') { res.status(405).json({ error: 'Method not allowed' }); return; }
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')? authHeader.slice(7): null;
+    if (!token) { res.status(401).json({ error: 'Missing auth token' }); return; }
+    let decoded: admin.auth.DecodedIdToken;
+    try { decoded = await enforceLLMAccessHttp(token); } catch (e:any) { const code = e?.code === 'permission-denied' ? 403 : 401; res.status(code).json({ error: 'Not permitted' }); return; }
+    const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+    const modelName = await selectModelForUser(decoded.uid, 'gemini-3-flash-preview');
+    const prompt = 'Return a short JSON object {"ping":"pong"}';
+    const { text, promptHash, responseHash, fallback, statusCode } = await runGeminiText(modelName, prompt, skipLLM, apiKey, true);
+    let parsed: any = null; try { parsed = JSON.parse(text); } catch {}
+    res.json({ ok: true, model: modelName, promptHash, responseHash, received: parsed, rawLength: text.length, fallback, statusCode, skipLLM });
+  } catch (e:any) { res.status(500).json({ error: e.message || 'Internal error' }); }
 });
 
 // Read-only prompt library listing (transparency)
@@ -289,7 +434,7 @@ export const generateDrafts = r.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Sign in required');
   }
-  enforceLLMAccess(context);
+  await enforceLLMAccess(context);
   const { concernId, variant } = data as { concernId?: string; variant?: string };
   if (!concernId) {
     throw new functions.https.HttpsError('invalid-argument', 'concernId required');
@@ -301,12 +446,11 @@ export const generateDrafts = r.https.onCall(async (data, context) => {
 
   // Basic rate limiting (max 10 per user per hour)
   await applyDraftRateLimit(db, context.auth.uid);
-  const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-  const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
   const modelName = await selectModelForUser(context.auth.uid, variant);
 
   const { prompt, templateVersion, templateHash } = buildDraftOptionsPrompt(concern.title, concern.description);
-  const { promptHash, responseHash, parsed, text } = await runGeminiDrafts(modelName, prompt, skipLLM, apiKey);
+  const { promptHash, responseHash, parsed, text, fallback } = await runGeminiDrafts(modelName, prompt, skipLLM, apiKey);
 
   // If drafts already exist for this promptHash on this concern, skip (cache hit)
   const existing = await db.collection('drafts')
@@ -325,7 +469,7 @@ export const generateDrafts = r.https.onCall(async (data, context) => {
       version: 1,
       text: `# Option ${opt.label || String.fromCharCode(65+idx)}\n\n${opt.text}`,
       authors: [{ uid: context.auth!.uid, role: 'author' }],
-      modelMeta: { model: modelName, promptHash, responseHash },
+      modelMeta: { model: modelName, promptHash, responseHash, fallback: !!fallback }, // fallback appended once, immutable thereafter
       status: 'drafting',
       citations: [],
       provenance: {
@@ -335,7 +479,8 @@ export const generateDrafts = r.https.onCall(async (data, context) => {
         rawResponseSize: text.length,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         templateVersion,
-        templateHash
+        templateHash,
+        fallback: !!fallback
       },
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -343,7 +488,7 @@ export const generateDrafts = r.https.onCall(async (data, context) => {
   });
   await batch.commit();
   await logEvent({ event: 'generateDrafts', uid: context.auth.uid, refId: concernId, data: { created: Math.min(3, parsed.options.length) } });
-  return { created: Math.min(3, parsed.options.length), cached: false, model: modelName };
+  return { created: Math.min(3, parsed.options.length), cached: false, model: modelName, fallback };
 });
 
 // CORS-enabled HTTP fallback (in case callable CORS edge cases occur in some environments)
@@ -372,7 +517,7 @@ export const generateDraftsHttp = r.https.onRequest(async (req, res) => {
       return;
     }
     let decoded: admin.auth.DecodedIdToken;
-    try { decoded = await enforceLLMAccessHttp(token); } catch (e:any) {
+  try { decoded = await enforceLLMAccessHttp(token); } catch (e:any) {
       const code = e?.code === 'permission-denied' ? 403 : 401;
       res.status(code).json({ error: 'Not permitted' });
       return;
@@ -389,11 +534,10 @@ export const generateDraftsHttp = r.https.onRequest(async (req, res) => {
     if (!concernSnap.exists) { res.status(404).json({ error: 'Concern not found' }); return; }
     const concern = concernSnap.data() as any;
     await applyDraftRateLimit(db, decoded.uid);
-  const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-  const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
     const modelName = await selectModelForUser(decoded.uid, variant);
     const { prompt, templateVersion, templateHash } = buildDraftOptionsPrompt(concern.title, concern.description);
-    const { promptHash, responseHash, parsed, text } = await runGeminiDrafts(modelName, prompt, skipLLM, apiKey);
+  const { promptHash, responseHash, parsed, text, fallback } = await runGeminiDrafts(modelName, prompt, skipLLM, apiKey);
     const existing = await db.collection('drafts')
       .where('concernId','==', concernId)
       .where('modelMeta.promptHash','==', promptHash)
@@ -408,17 +552,17 @@ export const generateDraftsHttp = r.https.onRequest(async (req, res) => {
         version: 1,
         text: `# Option ${opt.label || String.fromCharCode(65+idx)}\n\n${opt.text}`,
         authors: [{ uid: decoded.uid, role: 'author' }],
-        modelMeta: { model: modelName, promptHash, responseHash },
+        modelMeta: { model: modelName, promptHash, responseHash, fallback: !!fallback },
         status: 'drafting',
         citations: [],
-    provenance: { promptHash, responseHash, modelVersion: modelName, rawResponseSize: text.length, createdAt: admin.firestore.FieldValue.serverTimestamp(), templateVersion, templateHash },
+        provenance: { promptHash, responseHash, modelVersion: modelName, rawResponseSize: text.length, createdAt: admin.firestore.FieldValue.serverTimestamp(), templateVersion, templateHash, fallback: !!fallback },
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
     });
     await batch.commit();
     await logEvent({ event: 'generateDrafts', uid: decoded.uid, refId: concernId, data: { created: Math.min(3, parsed.options.length), model: modelName } });
-    res.json({ created: Math.min(3, parsed.options.length), cached: false, via: 'http', model: modelName });
+  res.json({ created: Math.min(3, parsed.options.length), cached: false, via: 'http', model: modelName, fallback });
   } catch (e: any) {
     console.error('generateDraftsHttp error', e);
     res.status(500).json({ error: e.message || 'Internal error', code: 'drafts_http_failed' });
@@ -435,6 +579,21 @@ export const createBallot = r.https.onCall(async (data, context) => {
   if (!['simple','approval','rcv'].includes(type)) throw new functions.https.HttpsError('invalid-argument','Unsupported type');
   if (!TIER_ORDER.includes(minTier as any)) throw new functions.https.HttpsError('invalid-argument','Invalid minTier');
   const db = admin.firestore();
+  // Server-side tier gating (parity with Firestore rules). Require at least 'verified' and user tier >= requested minTier.
+  try {
+    const userDoc = await db.collection('users').doc(context.auth.uid).get();
+    const userTier = userDoc.exists ? (userDoc.data() as any).tier || 'basic' : 'basic';
+    const rank = tierRank(userTier);
+    if (rank < tierRank('verified')) {
+      throw new functions.https.HttpsError('permission-denied','Tier too low to create ballot');
+    }
+    if (rank < tierRank(minTier)) {
+      throw new functions.https.HttpsError('permission-denied','Tier below specified minTier');
+    }
+  } catch (e) {
+    if (e instanceof functions.https.HttpsError) throw e;
+    throw new functions.https.HttpsError('failed-precondition','Tier check failed');
+  }
   await applyBallotCreateRateLimit(db, context.auth.uid);
   const concernSnap = await db.collection('concerns').doc(concernId).get();
   if (!concernSnap.exists) throw new functions.https.HttpsError('not-found','Concern not found');
@@ -527,6 +686,16 @@ export const createBallotHttp = r.https.onRequest(async (req, res) => {
     if (!['simple','approval','rcv'].includes(type)) { res.status(400).json({ error: 'Unsupported type' }); return; }
     if (!TIER_ORDER.includes((minTier||'').toLowerCase())) { res.status(400).json({ error: 'Invalid minTier' }); return; }
     const db = admin.firestore();
+    // Server-side tier gating (HTTP): must be verified+ and >= minTier requested
+    try {
+      const userDoc = await db.collection('users').doc(decoded.uid).get();
+      const userTier = userDoc.exists ? (userDoc.data() as any).tier || 'basic' : 'basic';
+      const rank = tierRank(userTier);
+      if (rank < tierRank('verified')) { res.status(403).json({ error: 'Tier too low to create ballot' }); return; }
+      if (rank < tierRank(minTier)) { res.status(403).json({ error: 'Tier below specified minTier' }); return; }
+    } catch (e:any) {
+      res.status(500).json({ error: 'Tier check failed' }); return;
+    }
   const concernSnap = await db.collection('concerns').doc(concernId).get();
   await applyBallotCreateRateLimit(db, decoded.uid);
     if (!concernSnap.exists) { res.status(404).json({ error: 'Concern not found' }); return; }
@@ -632,7 +801,7 @@ export const castVote = r.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError('failed-precondition','Ballot closed');
   }
   await applyVoteRateLimit(db, context.auth.uid, ballotId);
-  const secret = process.env.RECEIPTS_SECRET || (functions.config().receipts && functions.config().receipts.secret);
+  const secret = getReceiptSecret();
   if (!secret) throw new functions.https.HttpsError('failed-precondition','Receipt secret not configured');
   const voterHash = createHash('sha256').update(context.auth.uid + ballotId).digest('hex');
   let votePayload: any = {};
@@ -655,10 +824,11 @@ export const castVote = r.https.onCall(async (data, context) => {
     const sig = await kmsSign(Buffer.from(canonical));
     if (sig) kmsSignature = sig;
   } catch { /* ignore */ }
-  const voteRef = db.collection('votes').doc(`${ballotId}_${context.auth.uid}`);
+  const voteRef = db.collection('votes').doc(voterHash);
   await voteRef.set({
-    voteId: voteRef.id,
+    voteId: voterHash,
     ballotId,
+    voterUid: context.auth.uid,
     voterHash,
     ...votePayload,
     receiptHash,
@@ -667,7 +837,7 @@ export const castVote = r.https.onCall(async (data, context) => {
     updatedAt: now
   }, { merge: true });
   await logEvent({ event: 'castVote', uid: context.auth.uid, refId: ballotId, data: { type: ballot.type } });
-  return { receipt: `WeVote-RECEIPT-${receiptHash.slice(0,8)}`, receiptHash };
+  return { receipt: `CSR-RECEIPT-${receiptHash.slice(0,8)}`, receiptHash };
 });
 
 // HTTP fallback for castVote
@@ -716,7 +886,7 @@ export const castVoteHttp = r.https.onRequest(async (req, res) => {
     const now = admin.firestore.Timestamp.now();
     if (ballot.status !== 'open' || ballot.endAt.toMillis() < now.toMillis()) { res.status(400).json({ error: 'Ballot closed' }); return; }
   await applyVoteRateLimit(db, decoded.uid, ballotId);
-    const secret = process.env.RECEIPTS_SECRET || (functions.config().receipts && functions.config().receipts.secret);
+  const secret = getReceiptSecret();
     if (!secret) { res.status(500).json({ error: 'Receipt secret not configured' }); return; }
     const voterHash = createHash('sha256').update(decoded.uid + ballotId).digest('hex');
     let votePayload: any = {};
@@ -734,10 +904,10 @@ export const castVoteHttp = r.https.onRequest(async (req, res) => {
   const canonical = buildVoteCanonical(ballotId, decoded.uid, votePayload, now.toMillis());
     const receiptHash = createHmac('sha256', secret).update(canonical).digest('hex').slice(0,32);
     let kmsSignature: any = null; try { const sig = await kmsSign(Buffer.from(canonical)); if (sig) kmsSignature = sig; } catch {}
-    const voteRef = db.collection('votes').doc(`${ballotId}_${decoded.uid}`);
-    await voteRef.set({ voteId: voteRef.id, ballotId, voterHash, ...votePayload, receiptHash, kmsSignature: kmsSignature || null, createdAt: now, updatedAt: now }, { merge: true });
+    const voteRef = db.collection('votes').doc(voterHash);
+    await voteRef.set({ voteId: voterHash, ballotId, voterUid: decoded.uid, voterHash, ...votePayload, receiptHash, kmsSignature: kmsSignature || null, createdAt: now, updatedAt: now }, { merge: true });
     await logEvent({ event: 'castVote', uid: decoded.uid, refId: ballotId, data: { type: ballot.type } });
-    res.json({ receipt: `WeVote-RECEIPT-${receiptHash.slice(0,8)}`, receiptHash });
+    res.json({ receipt: `CSR-RECEIPT-${receiptHash.slice(0,8)}`, receiptHash });
   } catch (e: any) {
     console.error('castVoteHttp error', e);
     res.status(500).json({ error: e.message || 'Internal error' });
@@ -758,20 +928,85 @@ export const tallyBallot = r.https.onCall(async (data, context) => {
   if (ballot.status === 'tallied') return { alreadyTallied: true, results: ballot.results };
   const votesSnap = await db.collection('votes').where('ballotId','==', ballotId).get();
   const votes = votesSnap.docs.map(d=>d.data());
-  let results: TallyResult = { counts: {}, total: votes.length };
+  
+  // Resolve delegations
+  const concernSnap = await db.collection('concerns').doc(ballot.concernId).get();
+  const concern = concernSnap.exists ? concernSnap.data() as any : {};
+  const topics = concern.topics || [];
+  
+  const usersSnap = await db.collection('users').get();
+  const delegationMap: Record<string, string> = {};
+  usersSnap.docs.forEach(doc => {
+    const udata = doc.data();
+    if (udata.delegations) {
+      for (const topic of topics) {
+        const delegate = udata.delegations[`topic:${topic}`];
+        if (delegate) {
+          delegationMap[doc.id] = delegate;
+          break;
+        }
+      }
+    }
+  });
+
+  const directVoteMap = new Map<string, any>();
+  votes.forEach(v => {
+    if (v.voterUid) directVoteMap.set(v.voterUid, v);
+  });
+
+  const weights = new Map<string, number>();
+  directVoteMap.forEach((_, uid) => weights.set(uid, 1));
+
+  usersSnap.docs.forEach(doc => {
+    const userId = doc.id;
+    if (directVoteMap.has(userId)) return;
+    let current = userId;
+    const path = new Set<string>();
+    path.add(current);
+    let depth = 0;
+    while (delegationMap[current] && depth < 5) {
+      const next = delegationMap[current];
+      if (path.has(next)) break;
+      path.add(next);
+      current = next;
+      depth++;
+      if (directVoteMap.has(current)) {
+        const w = weights.get(current) || 0;
+        weights.set(current, w + 1);
+        break;
+      }
+    }
+  });
+
+  const totalWeight = Array.from(weights.values()).reduce((a,b)=>a+b,0);
+  let results: TallyResult = { counts: {}, total: totalWeight };
   if (ballot.type === 'simple') {
     ballot.options.forEach((o: any)=> results.counts[o.id]=0);
-    votes.forEach(v=> { if (v.choice) results.counts[v.choice]=(results.counts[v.choice]||0)+1; });
+    votes.forEach(v=> {
+      if (v.choice && v.voterUid) {
+        const w = weights.get(v.voterUid) || 1;
+        results.counts[v.choice] = (results.counts[v.choice]||0) + w;
+      }
+    });
     const winner = Object.entries(results.counts).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
     results.winner = winner;
   } else if (ballot.type === 'approval') {
     ballot.options.forEach((o: any)=> results.counts[o.id]=0);
-    votes.forEach(v=> { (v.approvals||[]).forEach((id: string)=> results.counts[id]=(results.counts[id]||0)+1); });
+    votes.forEach(v=> {
+      if (v.voterUid) {
+        const w = weights.get(v.voterUid) || 1;
+        (v.approvals||[]).forEach((id: string)=> results.counts[id]=(results.counts[id]||0)+w);
+      }
+    });
     const winner = Object.entries(results.counts).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
     results.winner = winner;
   } else { // rcv via shared lib
-    const rcvBallots = votes.map((v: any) => ({ ranking: Array.isArray(v.ranking) ? v.ranking.filter((c:string)=> ballot.options.some((o:any)=>o.id===c)) : [] }));
-  const outcome = tallyRCV(rcvBallots);
+    const rcvBallots = votes.map((v: any) => ({
+      ranking: Array.isArray(v.ranking) ? v.ranking.filter((c:string)=> ballot.options.some((o:any)=>o.id===c)) : [],
+      weight: v.voterUid ? (weights.get(v.voterUid) || 1) : 1
+    }));
+    const tieBreaker = ballot.options.map((o: any) => o.id);
+    const outcome = tallyRCV(rcvBallots, tieBreaker);
     results.rounds = outcome.rounds;
     results.winner = outcome.winner;
     if (typeof outcome.exhausted === 'number') results.exhausted = outcome.exhausted;
@@ -795,14 +1030,25 @@ export const tallyBallot = r.https.onCall(async (data, context) => {
       tx.set(ballotRef, { status: 'tallied', results, tallySignature, tallyHash, updatedAt: dbNow }, { merge: true });
       return;
     }
-    // Get last ledger entry
+    // Allocate next ledger sequence via singleton meta doc to avoid race conditions.
     const ledgerCol = admin.firestore().collection('transparency_ledger');
-    const lastSnap = await tx.get(ledgerCol.orderBy('seq','desc').limit(1));
-    let seq = 1; let prevHash: string | null = null;
-    if (!lastSnap.empty) {
-      const last = lastSnap.docs[0].data() as any;
-      seq = (last.seq || 0) + 1;
-      prevHash = last.entryHash;
+    const metaRef = admin.firestore().collection('ledger_meta').doc('sequence');
+    const metaSnap = await tx.get(metaRef);
+    let seq: number; let prevHash: string | null;
+    if (metaSnap.exists) {
+      const md = metaSnap.data() as any;
+      seq = (md.lastSeq || 0) + 1;
+      prevHash = md.lastEntryHash || null;
+    } else {
+      // Migration fallback: derive from existing ledger if any
+      const lastSnap = await tx.get(ledgerCol.orderBy('seq','desc').limit(1));
+      if (!lastSnap.empty) {
+        const last = lastSnap.docs[0].data() as any;
+        seq = (last.seq || 0) + 1;
+        prevHash = last.entryHash;
+      } else {
+        seq = 1; prevHash = null;
+      }
     }
     const dataPayload = { kind: 'tally', ballotId, results, ts: Date.now() };
     const { canonical, entryHash } = buildCanonical(seq, prevHash, dataPayload);
@@ -810,6 +1056,8 @@ export const tallyBallot = r.https.onCall(async (data, context) => {
     try { const sig = await kmsSign(Buffer.from(canonical)); if (sig) ledgerSignature = sig; } catch { /* ignore */ }
     const ledgerRef = ledgerCol.doc();
     tx.set(ledgerRef, { ledgerId: ledgerRef.id, seq, prevHash, entryHash, data: dataPayload, canonical, signature: ledgerSignature, createdAt: dbNow });
+    // Update meta doc with new sequence & hash (idempotent for this transaction)
+    tx.set(metaRef, { lastSeq: seq, lastEntryHash: entryHash, updatedAt: dbNow }, { merge: true });
     tx.set(ballotRef, { status: 'tallied', results, tallySignature, tallyHash, ledgerId: ledgerRef.id, updatedAt: dbNow }, { merge: true });
   });
   await logEvent({ event: 'tallyBallot', uid: context.auth.uid, refId: ballotId, data: { winner: results.winner } });
@@ -863,7 +1111,7 @@ export const verifyReceipt = r.https.onCall(async (data, context) => {
   const result: any = {
     valid: true,
     ballotId: vote.ballotId,
-    shortCode: `WeVote-RECEIPT-${receiptHash.slice(0,8)}`,
+    shortCode: `CSR-RECEIPT-${receiptHash.slice(0,8)}`,
     type: vote.ranking ? 'rcv' : (vote.approvals ? 'approval' : 'simple'),
     submittedAt: vote.updatedAt || vote.createdAt || null
   };
@@ -896,7 +1144,7 @@ export const verifyReceiptHttp = r.https.onRequest(async (req, res) => {
     const result: any = {
       valid: true,
       ballotId: vote.ballotId,
-      shortCode: `WeVote-RECEIPT-${receiptHash.slice(0,8)}`,
+      shortCode: `CSR-RECEIPT-${receiptHash.slice(0,8)}`,
       type: vote.ranking ? 'rcv' : (vote.approvals ? 'approval' : 'simple'),
       submittedAt: vote.updatedAt || vote.createdAt || null
     };
@@ -1530,10 +1778,81 @@ async function applyChatConcernRateLimit(db: FirebaseFirestore.Firestore, uid: s
 // Firestore doc shape (collection: concern_chats/{concernId}/messages/{msgId}) not stored yet; we keep ephemeral chat client-side for now to reduce write volume.
 // Instead, we optionally persist summarized objects later when generating drafts (future iteration can add chat persistence & provenance chain).
 
+export const chatRepresentative = r.https.onCall(async (data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in');
+  await enforceLLMAccess(context);
+  const { messages } = data as { messages?: { role: 'user'|'assistant'; text: string }[] };
+  if (!Array.isArray(messages)) throw new functions.https.HttpsError('invalid-argument','messages required');
+  const db = admin.firestore();
+  await applyChatRateLimit(db, context.auth.uid);
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+  const modelName = await selectModelForUser(context.auth.uid, 'gemini-3-flash-preview');
+  
+  if (skipLLM) {
+    return { reply: "Stub representative reply.", extractedConcern: null };
+  }
+  
+  const { reply, extractedConcern } = await runGeminiRepresentative(modelName, messages, apiKey!);
+  
+  let concernId: string | null = null;
+  if (extractedConcern && extractedConcern.title && extractedConcern.description) {
+    const ref = await db.collection('concerns').add({
+      title: extractedConcern.title,
+      description: extractedConcern.description,
+      status: 'idea',
+      createdBy: context.auth.uid,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    concernId = ref.id;
+  }
+  
+  return { reply, extractedConcern, concernId };
+});
+
+export const chatRepresentativeHttp = r.https.onRequest(async (req,res) => {
+  const origin = req.headers.origin || '*';
+  res.set('Access-Control-Allow-Origin', origin); res.set('Vary','Origin'); res.set('Access-Control-Allow-Headers','Content-Type, Authorization'); res.set('Access-Control-Allow-Methods','POST, OPTIONS'); res.set('Access-Control-Allow-Credentials','true');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method !== 'POST') { res.status(405).json({ error: 'Method not allowed' }); return; }
+  try {
+    const authHeader = req.headers.authorization||''; const token = authHeader.startsWith('Bearer ')? authHeader.slice(7): null; if (!token) { res.status(401).json({ error: 'Missing auth token' }); return; }
+    let decoded: admin.auth.DecodedIdToken; try { decoded = await enforceLLMAccessHttp(token); } catch (e:any) { const code = e?.code === 'permission-denied' ? 403 : 401; res.status(code).json({ error: 'Not permitted', code: 'llm_restricted' }); return; }
+    const body = typeof req.body === 'object'? req.body : {}; const { messages } = body;
+    if (!Array.isArray(messages)) { res.status(400).json({ error: 'messages required' }); return; }
+    const db = admin.firestore();
+    try { await applyChatRateLimit(db, decoded.uid); } catch (e:any) { res.status(429).json({ error: e.message || 'Rate limited' }); return; }
+    const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+    const modelName = await selectModelForUser(decoded.uid, 'gemini-3-flash-preview');
+    
+    if (skipLLM) {
+      res.json({ reply: "Stub representative reply.", extractedConcern: null });
+      return;
+    }
+    
+    const { reply, extractedConcern } = await runGeminiRepresentative(modelName, messages, apiKey!);
+    
+    let concernId: string | null = null;
+    if (extractedConcern && extractedConcern.title && extractedConcern.description) {
+      const ref = await db.collection('concerns').add({
+        title: extractedConcern.title,
+        description: extractedConcern.description,
+        status: 'idea',
+        createdBy: decoded.uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      concernId = ref.id;
+    }
+    
+    res.json({ reply, extractedConcern, concernId });
+  } catch (e:any) { console.error('chatRepresentativeHttp error', e); res.status(500).json({ error: e.message || 'Internal error' }); }
+});
+
 export const chatConcern = r.https.onCall(async (data, context) => {
   if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in');
   // Development LLM feature gate
-  enforceLLMAccess(context);
+  await enforceLLMAccess(context);
   const { concernId, title, messages } = data as { concernId?: string; title?: string; messages?: { role: 'user'|'assistant'; text: string }[] };
   if (!concernId || !title || !Array.isArray(messages)) throw new functions.https.HttpsError('invalid-argument','concernId,title,messages required');
   const db = admin.firestore();
@@ -1542,13 +1861,12 @@ export const chatConcern = r.https.onCall(async (data, context) => {
   // Dedicated chat rate limit
   await applyChatRateLimit(db, context.auth.uid);
   await applyChatConcernRateLimit(db, context.auth.uid, concernId);
-  const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-  const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
-  const modelName = await selectModelForUser(context.auth.uid, 'gemini-2.5-flash-lite'); // chat always uses cheapest adequate
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+  const modelName = await selectModelForUser(context.auth.uid, 'gemini-3-flash-preview'); // chat always uses cheapest adequate
   const { prompt, templateVersion, templateHash } = buildConcernChatPrompt(title, messages);
-  const { text, promptHash, responseHash } = await runGeminiText(modelName, prompt, skipLLM, apiKey, false);
+  const { text, promptHash, responseHash, fallback } = await runGeminiText(modelName, prompt, skipLLM, apiKey, false);
   await logEvent({ event: 'chatConcern', uid: context.auth.uid, refId: concernId, data: { promptHash, responseHash } });
-  return { reply: text, model: modelName, promptHash, responseHash, templateVersion, templateHash };
+  return { reply: text, model: modelName, promptHash, responseHash, templateVersion, templateHash, fallback };
 });
 
 export const chatConcernHttp = r.https.onRequest(async (req,res) => {
@@ -1563,32 +1881,30 @@ export const chatConcernHttp = r.https.onRequest(async (req,res) => {
     if (!concernId || !title || !Array.isArray(messages)) { res.status(400).json({ error: 'concernId,title,messages required' }); return; }
     const db = admin.firestore(); const concernSnap = await db.collection('concerns').doc(concernId).get(); if (!concernSnap.exists) { res.status(404).json({ error: 'Concern not found' }); return; }
   try { await applyChatRateLimit(db, decoded.uid); await applyChatConcernRateLimit(db, decoded.uid, concernId); } catch (e:any) { res.status(429).json({ error: e.message || 'Rate limited' }); return; }
-    const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-    const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
-    const modelName = await selectModelForUser(decoded.uid, 'gemini-2.5-flash-lite');
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+    const modelName = await selectModelForUser(decoded.uid, 'gemini-3-flash-preview');
     const { prompt, templateVersion, templateHash } = buildConcernChatPrompt(title, messages);
-    const { text, promptHash, responseHash } = await runGeminiText(modelName, prompt, skipLLM, apiKey, false);
+  const { text, promptHash, responseHash, fallback } = await runGeminiText(modelName, prompt, skipLLM, apiKey, false);
     await logEvent({ event: 'chatConcern', uid: decoded.uid, refId: concernId, data: { promptHash, responseHash } });
-    res.json({ reply: text, model: modelName, promptHash, responseHash, templateVersion, templateHash });
+  res.json({ reply: text, model: modelName, promptHash, responseHash, templateVersion, templateHash, fallback });
   } catch (e:any) { console.error('chatConcernHttp error', e); res.status(500).json({ error: e.message || 'Internal error' }); }
 });
 
 export const summarizeConcern = r.https.onCall(async (data, context) => {
   if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in');
   // Development LLM feature gate
-  enforceLLMAccess(context);
+  await enforceLLMAccess(context);
   const { concernId, title, messages } = data as { concernId?: string; title?: string; messages?: { role: 'user'|'assistant'; text: string }[] };
   if (!concernId || !title || !Array.isArray(messages)) throw new functions.https.HttpsError('invalid-argument','concernId,title,messages required');
   const db = admin.firestore(); const concernSnap = await db.collection('concerns').doc(concernId).get(); if (!concernSnap.exists) throw new functions.https.HttpsError('not-found','Concern not found');
   await applyChatRateLimit(db, context.auth.uid);
   await applyChatConcernRateLimit(db, context.auth.uid, concernId);
-  const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-  const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
-  const modelName = await selectModelForUser(context.auth.uid, 'gemini-2.5-flash-lite');
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+  const modelName = await selectModelForUser(context.auth.uid, 'gemini-3-flash-preview');
   const { prompt, templateVersion, templateHash } = buildConcernSummaryPrompt(title, messages);
-  const { text, promptHash, responseHash, parsed } = await runGeminiText(modelName, prompt, skipLLM, apiKey, true);
+  const { text, promptHash, responseHash, parsed, fallback } = await runGeminiText(modelName, prompt, skipLLM, apiKey, true);
   await logEvent({ event: 'summarizeConcern', uid: context.auth.uid, refId: concernId, data: { promptHash, responseHash } });
-  return { summary: parsed, model: modelName, promptHash, responseHash, templateVersion, templateHash };
+  return { summary: parsed, model: modelName, promptHash, responseHash, templateVersion, templateHash, fallback };
 });
 
 export const summarizeConcernHttp = r.https.onRequest(async (req,res) => {
@@ -1603,13 +1919,12 @@ export const summarizeConcernHttp = r.https.onRequest(async (req,res) => {
     if (!concernId || !title || !Array.isArray(messages)) { res.status(400).json({ error: 'concernId,title,messages required' }); return; }
     const db = admin.firestore(); const concernSnap = await db.collection('concerns').doc(concernId).get(); if (!concernSnap.exists) { res.status(404).json({ error: 'Concern not found' }); return; }
   try { await applyChatRateLimit(db, decoded.uid); await applyChatConcernRateLimit(db, decoded.uid, concernId); } catch (e:any) { res.status(429).json({ error: e.message || 'Rate limited' }); return; }
-    const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-    const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
-    const modelName = await selectModelForUser(decoded.uid, 'gemini-2.5-flash-lite');
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+    const modelName = await selectModelForUser(decoded.uid, 'gemini-3-flash-preview');
     const { prompt, templateVersion, templateHash } = buildConcernSummaryPrompt(title, messages);
-    const { text, promptHash, responseHash, parsed } = await runGeminiText(modelName, prompt, skipLLM, apiKey, true);
+  const { text, promptHash, responseHash, parsed, fallback } = await runGeminiText(modelName, prompt, skipLLM, apiKey, true);
     await logEvent({ event: 'summarizeConcern', uid: decoded.uid, refId: concernId, data: { promptHash, responseHash } });
-    res.json({ summary: parsed, model: modelName, promptHash, responseHash, templateVersion, templateHash });
+  res.json({ summary: parsed, model: modelName, promptHash, responseHash, templateVersion, templateHash, fallback });
   } catch (e:any) { console.error('summarizeConcernHttp error', e); res.status(500).json({ error: e.message || 'Internal error' }); }
 });
 
@@ -1619,7 +1934,7 @@ export const summarizeConcernHttp = r.https.onRequest(async (req,res) => {
 export const chatSend = r.https.onCall( async (data, context) => {
   if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in');
   // Development LLM feature gate
-  enforceLLMAccess(context);
+  await enforceLLMAccess(context);
   const { concernId, message } = data as { concernId?: string; message?: string };
   if (!concernId || !message) throw new functions.https.HttpsError('invalid-argument','concernId & message required');
   const db = admin.firestore();
@@ -1638,15 +1953,14 @@ export const chatSend = r.https.onCall( async (data, context) => {
     summaryBlock = `\n--- EARLIER CONTEXT SUMMARY START ---\n${summary}\n--- EARLIER CONTEXT SUMMARY END ---\n`;
   }
   const history = tail; // use tail as direct messages input to prompt builder
-  const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-  const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
-  const modelName = await selectModelForUser(context.auth.uid, 'gemini-2.5-flash-lite');
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+  const modelName = await selectModelForUser(context.auth.uid, 'gemini-3-flash-preview');
   // Build prompt with lightweight agent instruction layer for action suggestions
   const baseTitle = (concernSnap.data() as any).title || 'Concern';
   const agentTip = '\nIf the user seems ready, after your answer add a line starting with ACTION_JSON: followed by JSON {"actions":[{"type":"generate_drafts","label":"Generate Draft Options"}]} or empty list. Only suggest generate_drafts when drafts do not yet exist.';
   const { prompt, templateVersion, templateHash } = buildConcernChatPrompt(baseTitle, history as { role: 'user' | 'assistant'; text: string }[]);
   const combinedPrompt = summaryBlock + prompt + agentTip;
-  const { text, promptHash, responseHash } = await runGeminiText(modelName, combinedPrompt, skipLLM, apiKey, false);
+  const { text, promptHash, responseHash, fallback } = await runGeminiText(modelName, combinedPrompt, skipLLM, apiKey, false);
   // Structured action suggestion parsing
   const ALLOWED_ACTIONS = new Set(['generate_drafts']);
   const parsedAct = parseActionSuggestions(text, ALLOWED_ACTIONS);
@@ -1655,7 +1969,19 @@ export const chatSend = r.https.onCall( async (data, context) => {
   // Persist user + assistant messages
   const MAX_CHARS = 1800;
   if (reply.length > MAX_CHARS) reply = reply.slice(0, MAX_CHARS) + '…';
-  const moderation = moderateAssistantReply(reply);
+  let disallowedTerms = ['forbiddenterm'];
+  try {
+    const configSnap = await db.collection('config').doc('moderation').get();
+    if (configSnap.exists) {
+      const data = configSnap.data() as any;
+      if (Array.isArray(data.disallowedTerms)) {
+        disallowedTerms = data.disallowedTerms;
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to load dynamic moderation config', e);
+  }
+  const moderation = moderateAssistantReply(reply, disallowedTerms);
   reply = moderation.sanitized;
   // Already filtered by parser
   const chatCol = db.collection('concern_chats').doc(concernId).collection('messages');
@@ -1668,7 +1994,7 @@ export const chatSend = r.https.onCall( async (data, context) => {
   });
   const tokenEst = estimateTokens(combinedPrompt) + estimateTokens(reply);
   await logEvent({ event: 'chatSend', uid: context.auth.uid, refId: concernId, data: { promptHash, responseHash, actions: actions.map(a=>a.type), tokenEst, actionBlock: parsedAct.rawMatched && actions.length === 0 ? 'filtered' : undefined } });
-  return { reply, actions, promptHash, responseHash, model: modelName, moderation: { flags: moderation.flags, blocked: moderation.blocked }, tokenEst };
+  return { reply, actions, promptHash, responseHash, model: modelName, moderation: { flags: moderation.flags, blocked: moderation.blocked }, tokenEst, fallback };
 });
 
 export const chatSendHttp = r.https.onRequest(async (req,res) => {
@@ -1694,19 +2020,30 @@ export const chatSendHttp = r.https.onRequest(async (req,res) => {
       summaryBlock = `\n--- EARLIER CONTEXT SUMMARY START ---\n${summary}\n--- EARLIER CONTEXT SUMMARY END ---\n`;
     }
     const history = tail;
-    const apiKey = process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
-    const skipLLM = process.env.SKIP_LLM === '1' || process.env.TEST_SKIP_LLM === '1' || (functions.config().test && functions.config().test.skipllm);
-    const modelName = await selectModelForUser(decoded.uid, 'gemini-2.5-flash-lite');
+  const { geminiApiKey: apiKey, skipLLM } = getGeminiSettings();
+    const modelName = await selectModelForUser(decoded.uid, 'gemini-3-flash-preview');
     const baseTitle = (concernSnap.data() as any).title || 'Concern';
     const agentTip = '\nIf the user seems ready, after your answer add a line starting with ACTION_JSON: followed by JSON {"actions":[{"type":"generate_drafts","label":"Generate Draft Options"}]} or empty list. Only suggest generate_drafts when drafts do not yet exist.';
   const { prompt, templateVersion, templateHash } = buildConcernChatPrompt(baseTitle, history as { role: 'user' | 'assistant'; text: string }[]);
   const combinedPrompt = summaryBlock + prompt + agentTip;
-    const { text, promptHash, responseHash } = await runGeminiText(modelName, combinedPrompt, skipLLM, apiKey, false);
+  const { text, promptHash, responseHash, fallback } = await runGeminiText(modelName, combinedPrompt, skipLLM, apiKey, false);
   const ALLOWED_ACTIONS_HTTP = new Set(['generate_drafts']);
   const parsedAct = parseActionSuggestions(text, ALLOWED_ACTIONS_HTTP);
   let reply = parsedAct.reply; let actions: any[] = parsedAct.actions;
   const MAX_CHARS = 1800; if (reply.length > MAX_CHARS) reply = reply.slice(0, MAX_CHARS) + '…';
-  const moderation = moderateAssistantReply(reply); reply = moderation.sanitized;
+  let disallowedTerms = ['forbiddenterm'];
+  try {
+    const configSnap = await db.collection('config').doc('moderation').get();
+    if (configSnap.exists) {
+      const data = configSnap.data() as any;
+      if (Array.isArray(data.disallowedTerms)) {
+        disallowedTerms = data.disallowedTerms;
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to load dynamic moderation config', e);
+  }
+  const moderation = moderateAssistantReply(reply, disallowedTerms); reply = moderation.sanitized;
   // Already filtered
   const chatCol = db.collection('concern_chats').doc(concernId).collection('messages');
     const now = admin.firestore.FieldValue.serverTimestamp();
@@ -1717,7 +2054,132 @@ export const chatSendHttp = r.https.onRequest(async (req,res) => {
     });
   const tokenEst = estimateTokens(combinedPrompt) + estimateTokens(reply);
   await logEvent({ event: 'chatSend', uid: decoded.uid, refId: concernId, data: { promptHash, responseHash, actions: actions.map(a=>a.type), tokenEst, actionBlock: parsedAct.rawMatched && actions.length === 0 ? 'filtered' : undefined } });
-  res.json({ reply, actions, promptHash, responseHash, model: modelName, moderation: { flags: moderation.flags, blocked: moderation.blocked }, tokenEst });
+  res.json({ reply, actions, promptHash, responseHash, model: modelName, moderation: { flags: moderation.flags, blocked: moderation.blocked }, tokenEst, fallback });
   } catch (e:any) { console.error('chatSendHttp error', e); res.status(500).json({ error: e.message || 'Internal error' }); }
+});
+
+export const dailyConcernAggregation = r.pubsub.schedule('every 24 hours').onRun(async (context) => {
+  await runDailyAggregation();
+});
+
+export const dailyAgenticDrafter = r.pubsub.schedule('every 24 hours').onRun(async (context) => {
+  await runAgenticDrafter();
+});
+
+export const weeklyForumPinning = r.pubsub.schedule('every 168 hours').onRun(async (context) => {
+  await runWeeklyPinning();
+});
+
+// ---------------- Readiness Scoring (Concern) ----------------
+// Callable: returns readiness score & recommendations for a concern (no mutations)
+export const concernReadiness = r.https.onCall(async (data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in');
+  const { concernId } = data as { concernId?: string };
+  if (!concernId) throw new functions.https.HttpsError('invalid-argument','concernId required');
+  try {
+    const result = await evaluateConcernReadiness(concernId);
+    return { ok: true, concernId, ...result };
+  } catch (e:any) {
+    if (e.message === 'concern_not_found') throw new functions.https.HttpsError('not-found','Concern not found');
+    throw new functions.https.HttpsError('internal','Evaluation failed');
+  }
+});
+
+export const concernReadinessHttp = r.https.onRequest(async (req, res) => {
+  const origin = req.headers.origin || '*';
+  res.set('Access-Control-Allow-Origin', origin);
+  res.set('Vary','Origin');
+  res.set('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods','GET, OPTIONS');
+  res.set('Access-Control-Allow-Credentials','true');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method !== 'GET') { res.status(405).json({ error: 'Method not allowed' }); return; }
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')? authHeader.slice(7): null;
+    if (!token) { res.status(401).json({ error: 'Missing auth token' }); return; }
+    try { await admin.auth().verifyIdToken(token); } catch { res.status(401).json({ error: 'Invalid token' }); return; }
+    const concernId = (req.query.concernId as string) || '';
+    if (!concernId) { res.status(400).json({ error: 'concernId required' }); return; }
+    try {
+      const result = await evaluateConcernReadiness(concernId);
+      res.json({ ok: true, concernId, ...result });
+    } catch (e:any) {
+      if (e.message === 'concern_not_found') { res.status(404).json({ error: 'Concern not found' }); return; }
+      res.status(500).json({ error: 'Evaluation failed' });
+    }
+  } catch (e:any) { res.status(500).json({ error: e.message || 'Internal error' }); }
+});
+
+// ---------------- Concern Structure Update (Objectives / Constraints / Open Questions) ----------------
+// Allows an authenticated user who created the concern OR an admin to attach structured arrays.
+// Firestore mutation: merges { objectives: string[]|null, constraints: string[]|null, openQuestions: string[]|null }
+
+export const updateConcernStructure = r.https.onCall(async (data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated','Sign in');
+  const { concernId, objectives, constraints, openQuestions } = data as { concernId?: string; objectives?: any; constraints?: any; openQuestions?: any };
+  if (!concernId) throw new functions.https.HttpsError('invalid-argument','concernId required');
+  const db = admin.firestore();
+  const ref = db.collection('concerns').doc(concernId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new functions.https.HttpsError('not-found','Concern not found');
+  // Authorization: creator or admin
+  let allowed = false;
+  const cData = snap.data() as any;
+  if (cData.createdBy && cData.createdBy === context.auth.uid) allowed = true;
+  if (!allowed) {
+    const adminDoc = await db.collection('admins').doc(context.auth.uid).get();
+    if (adminDoc.exists) allowed = true;
+  }
+  if (!allowed) throw new functions.https.HttpsError('permission-denied','Not allowed');
+  const normObjectives = normalizeStringArray(objectives, 8, 160);
+  const normConstraints = normalizeStringArray(constraints, 8, 160);
+  const normOpen = normalizeStringArray(openQuestions, 10, 160);
+  await ref.set({
+    objectives: normObjectives || admin.firestore.FieldValue.delete(),
+    constraints: normConstraints || admin.firestore.FieldValue.delete(),
+    openQuestions: normOpen || admin.firestore.FieldValue.delete(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
+  await logEvent({ event: 'updateConcernStructure', uid: context.auth.uid, refId: concernId, data: { objectives: (normObjectives||[]).length, constraints: (normConstraints||[]).length, openQuestions: (normOpen||[]).length } });
+  return { ok: true, counts: { objectives: (normObjectives||[]).length, constraints: (normConstraints||[]).length, openQuestions: (normOpen||[]).length } };
+});
+
+export const updateConcernStructureHttp = r.https.onRequest(async (req, res) => {
+  const origin = req.headers.origin || '*';
+  res.set('Access-Control-Allow-Origin', origin);
+  res.set('Vary','Origin');
+  res.set('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods','POST, OPTIONS');
+  res.set('Access-Control-Allow-Credentials','true');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method !== 'POST') { res.status(405).json({ error: 'Method not allowed' }); return; }
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')? authHeader.slice(7): null;
+    if (!token) { res.status(401).json({ error: 'Missing auth token' }); return; }
+    let decoded: admin.auth.DecodedIdToken; try { decoded = await admin.auth().verifyIdToken(token); } catch { res.status(401).json({ error: 'Invalid token' }); return; }
+    const body = typeof req.body === 'object' ? req.body : {};
+    const { concernId, objectives, constraints, openQuestions } = body;
+    if (!concernId) { res.status(400).json({ error: 'concernId required' }); return; }
+    const db = admin.firestore();
+    const ref = db.collection('concerns').doc(concernId);
+    const snap = await ref.get(); if (!snap.exists) { res.status(404).json({ error: 'Concern not found' }); return; }
+    let allowed = false; const cData = snap.data() as any;
+    if (cData.createdBy && cData.createdBy === decoded.uid) allowed = true;
+    if (!allowed) { const adminDoc = await db.collection('admins').doc(decoded.uid).get(); if (adminDoc.exists) allowed = true; }
+    if (!allowed) { res.status(403).json({ error: 'Not allowed' }); return; }
+    const normObjectives = normalizeStringArray(objectives, 8, 160);
+    const normConstraints = normalizeStringArray(constraints, 8, 160);
+    const normOpen = normalizeStringArray(openQuestions, 10, 160);
+    await ref.set({
+      objectives: normObjectives || admin.firestore.FieldValue.delete(),
+      constraints: normConstraints || admin.firestore.FieldValue.delete(),
+      openQuestions: normOpen || admin.firestore.FieldValue.delete(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    await logEvent({ event: 'updateConcernStructure', uid: decoded.uid, refId: concernId, data: { objectives: (normObjectives||[]).length, constraints: (normConstraints||[]).length, openQuestions: (normOpen||[]).length } });
+    res.json({ ok: true, counts: { objectives: (normObjectives||[]).length, constraints: (normConstraints||[]).length, openQuestions: (normOpen||[]).length } });
+  } catch (e:any) { res.status(500).json({ error: e.message || 'Internal error' }); }
 });
 

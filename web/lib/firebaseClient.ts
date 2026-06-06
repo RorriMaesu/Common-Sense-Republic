@@ -1,5 +1,5 @@
-import { getAuth } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { getAuth, connectAuthEmulator } from 'firebase/auth';
+import { getFirestore, connectFirestoreEmulator } from 'firebase/firestore';
 import { getAnalytics, isSupported } from 'firebase/analytics';
 import { app } from './firebaseClientInternal';
 
@@ -12,3 +12,11 @@ if (typeof window !== 'undefined') {
 
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+
+// Local Emulator Connection (configured via .env.local: NEXT_PUBLIC_USE_EMULATORS=true)
+if (process.env.NEXT_PUBLIC_USE_EMULATORS === 'true') {
+  // eslint-disable-next-line no-console
+  console.log('Using Firebase Emulators (Auth:9099, Firestore:8080)');
+  connectAuthEmulator(auth, 'http://localhost:9099');
+  connectFirestoreEmulator(db, 'localhost', 8080);
+}

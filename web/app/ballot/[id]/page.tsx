@@ -75,9 +75,14 @@ export default function BallotDetail() {
   return (
     <div className="space-y-6">
       <div>
-    <h1 className="text-2xl font-semibold">Ballot {ballot.ballotId}</h1>
-    <p className="text-sm text-muted">Type: {ballot.type} · Status: {ballot.status} {ballot.status==='open' && (<span>· Time left: {countdown}</span>)} · Min Tier: {ballot.minTier || 'basic'}</p>
-    {!eligible && <p className="text-xs text-red-600 mt-1">Your tier ({userTier}) is below the required tier ({ballot.minTier}). You may view but not vote.</p>}
+        <h1 className="text-2xl font-semibold">{ballot.title || `Ballot ${ballot.ballotId}`}</h1>
+        <p className="text-sm text-muted">Type: {ballot.type} · Status: {ballot.status} {ballot.status==='open' && (<span>· Time left: {countdown}</span>)} · Min Tier: {ballot.minTier || 'basic'}</p>
+        {!eligible && <p className="text-xs text-red-600 mt-1">Your tier ({userTier}) is below the required tier ({ballot.minTier}). You may view but not vote.</p>}
+        {ballot.description && (
+          <div className="mt-4 p-4 rounded-xl border bg-gray-50 dark:bg-black/30 text-sm whitespace-pre-wrap leading-relaxed">
+            {ballot.description}
+          </div>
+        )}
       </div>
       {ballot.type==='simple' && (
         <div className="space-y-2">
@@ -196,6 +201,99 @@ export default function BallotDetail() {
             {verification.status==='error' && <p className="text-[10px] text-yellow-600">Error: {verification.detail}</p>}
           </div>
         </div>
+      )}
+
+      {/* Discussion Forum / Comment Thread Section */}
+      <BallotDiscussionSection ballotId={ballot.ballotId} user={user} />
+    </div>
+  );
+}
+
+interface Comment { id: string; authorEmail: string; text: string; createdAt: any; }
+
+function BallotDiscussionSection({ ballotId, user }: { ballotId: string; user: any }) {
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [commentText, setCommentText] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  async function loadComments() {
+    try {
+      const { collection, getDocs, query, orderBy, limit } = await import('firebase/firestore');
+      const q = query(
+        collection(db, 'ballots', ballotId, 'comments'),
+        orderBy('createdAt', 'asc'),
+        limit(100)
+      );
+      const snap = await getDocs(q);
+      setComments(snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) })));
+    } catch (err) {
+      console.error('Failed to load comments:', err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (ballotId) {
+      loadComments();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ballotId]);
+
+  async function postComment() {
+    if (!commentText.trim() || !user) return;
+    try {
+      const { collection, addDoc, serverTimestamp } = await import('firebase/firestore');
+      await addDoc(collection(db, 'ballots', ballotId, 'comments'), {
+        authorEmail: user.email || 'Anonymous',
+        authorUid: user.uid,
+        text: commentText.trim(),
+        createdAt: serverTimestamp()
+      });
+      setCommentText('');
+      await loadComments();
+    } catch (err) {
+      console.error('Failed to post comment:', err);
+    }
+  }
+
+  return (
+    <div className="border-t pt-6 space-y-4">
+      <h3 className="text-lg font-semibold tracking-tight">Ballot Debate & Discussion</h3>
+      {loading ? (
+        <p className="text-xs text-muted">Loading debate comments...</p>
+      ) : (
+        <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+          {comments.map(c => (
+            <div key={c.id} className="p-3 bg-surface border rounded-xl text-xs space-y-1">
+              <div className="flex justify-between font-bold text-muted text-[10px]">
+                <span>{c.authorEmail}</span>
+                <span>{c.createdAt?.toDate ? c.createdAt.toDate().toLocaleString() : 'Just now'}</span>
+              </div>
+              <p className="text-sm">{c.text}</p>
+            </div>
+          ))}
+          {comments.length === 0 && (
+            <p className="text-xs text-muted py-2">No discussion has started yet. Be the first to share your stance!</p>
+          )}
+        </div>
+      )}
+
+      {user ? (
+        <div className="flex gap-2">
+          <input
+            value={commentText}
+            onChange={e => setCommentText(e.target.value)}
+            placeholder="Share your thoughts or policy stance..."
+            className="input flex-1 text-xs"
+            onKeyDown={e => e.key === 'Enter' && postComment()}
+          />
+          <button onClick={postComment} disabled={!commentText.trim()} className="btn-primary text-xs px-4">
+            Post
+          </button>
+        </div>
+      ) : (
+        <p className="text-xs text-muted text-center py-2">Sign in to join the debate.</p>
       )}
     </div>
   );

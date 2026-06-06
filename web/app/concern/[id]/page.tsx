@@ -4,9 +4,11 @@ import { useEffect, useState, useRef } from 'react';
 import { doc, getDoc, collection, query, where, getDocs, orderBy } from 'firebase/firestore';
 import { db, auth } from '../../../lib/firebaseClient';
 import { onAuthStateChanged } from 'firebase/auth';
-import { generateDraftsSafe, reportContentSafe, chatSendSafe } from '../../../lib/functionsClient';
+import { generateDraftsSafe, reportContentSafe, chatSendSafe, concernReadinessSafe, updateConcernStructureSafe, summarizeConcernSafe } from '../../../lib/functionsClient';
 import { appendCitationsSafe, submitDraftReviewSafe } from '../../../lib/functionsClient';
 import Link from 'next/link';
+import FallbackBanner from '../../components/FallbackBanner';
+import { LocalLlmRouter } from '../../../lib/localLlmRouter';
 
 interface Draft { draftId: string; text: string; status: string; }
 
@@ -29,6 +31,26 @@ export default function ConcernDetailPage() {
   const [chatBusy, setChatBusy] = useState(false);
   const [chatExpanded, setChatExpanded] = useState(false); // mobile fullscreen toggle
   const [showActionModal, setShowActionModal] = useState<{ actions: any[] }|null>(null);
+  const [readiness, setReadiness] = useState<any>(null);
+  const [readinessLoading, setReadinessLoading] = useState(false);
+  const [structObjectives, setStructObjectives] = useState<string>('');
+  const [structConstraints, setStructConstraints] = useState<string>('');
+  const [structOpenQs, setStructOpenQs] = useState<string>('');
+  const [structureSaving, setStructureSaving] = useState(false);
+  const [structureSuggesting, setStructureSuggesting] = useState(false);
+
+  async function loadDraftsAndReadiness(concernId: string) {
+    const dq = query(collection(db, 'drafts'), where('concernId','==', concernId), orderBy('createdAt','asc'));
+    const draftsSnap = await getDocs(dq);
+    setDrafts(draftsSnap.docs.map(d => d.data() as any));
+    if (auth.currentUser) {
+      try {
+        setReadinessLoading(true);
+        const r = await concernReadinessSafe(concernId);
+        setReadiness(r);
+      } catch { /* ignore */ } finally { setReadinessLoading(false); }
+    }
+  }
   const chatExpandedInputRef = useRef<HTMLInputElement|null>(null);
   const expandBtnRef = useRef<HTMLButtonElement|null>(null);
   const chatScrollRef = useRef<HTMLDivElement|null>(null);
@@ -37,7 +59,7 @@ export default function ConcernDetailPage() {
   // Auto-scroll to bottom when messages change
   useEffect(()=> {
     const el = chatExpanded ? chatScrollFullRef.current : chatScrollRef.current;
-    if (!el) return;
+  if (!el) { return; }
     // slight delay to allow DOM paint
     requestAnimationFrame(()=> { el.scrollTop = el.scrollHeight; });
   }, [chatMessages, chatExpanded]);
@@ -60,36 +82,105 @@ export default function ConcernDetailPage() {
   },[]);
 
   useEffect(() => {
-    if (!id) return;
+  if (!id) { return; }
     (async () => {
       const snap = await getDoc(doc(db, 'concerns', id));
-      if (snap.exists()) setConcern({ id: snap.id, ...snap.data() });
-      const dq = query(collection(db, 'drafts'), where('concernId','==', id), orderBy('createdAt','asc'));
-  const draftsSnap = await getDocs(dq);
-  setDrafts(draftsSnap.docs.map(d => d.data() as any));
+  if (snap.exists()) { setConcern({ id: snap.id, ...snap.data() }); }
+      await loadDraftsAndReadiness(id);
+      // preload structure inputs if present
+      const c = await getDoc(doc(db,'concerns', id));
+      if (c.exists()) {
+        const cd: any = c.data();
+        setStructObjectives((cd.objectives||[]).join('\n'));
+        setStructConstraints((cd.constraints||[]).join('\n'));
+        setStructOpenQs((cd.openQuestions||[]).join('\n'));
+      }
       setLoading(false);
     })();
   }, [id]);
 
   // Fetch user tier
-  useEffect(()=> { (async () => { if (!user) return; try { const us = await getDoc(doc(db,'users', user.uid)); if (us.exists()) setUserTier((us.data() as any).tier || 'basic'); } catch {} })(); }, [user]);
+  useEffect(()=> { (async () => { if (!user) { return; } try { const us = await getDoc(doc(db,'users', user.uid)); if (us.exists()) { setUserTier((us.data() as any).tier || 'basic'); } } catch {} })(); }, [user]);
 
   async function regenerate() {
-    if (!id) return;
+    if (!id) { return; }
     setGenerating(true); setMessage(undefined);
     try {
-  await generateDraftsSafe({ concernId: id });
-      setMessage('Drafts generation requested. Refreshing…');
-      // simple refetch
-      const dq = query(collection(db, 'drafts'), where('concernId','==', id), orderBy('createdAt','asc'));
-      const draftsSnap = await getDocs(dq);
-      setDrafts(draftsSnap.docs.map(d => d.data() as Draft));
-    } catch(e:any) { setMessage(e.message || 'Error'); }
+      // Use Local AI Router instead of cloud function
+      const llmMode = LocalLlmRouter.getRouteMode();
+      setMessage(`Generating draft options locally (${llmMode})...`);
+      
+      const systemPrompt = `You are a Legislative Option Generator for the Common Sense Republic.
+Your task is to write three distinct draft options to address the citizen's policy concern.
+Format the output EXACTLY as a JSON object with this schema:
+{
+  "options": [
+    { "label": "A", "text": "Draft option text representing one approach" },
+    { "label": "B", "text": "Draft option text representing an alternative approach" },
+    { "label": "C", "text": "Draft option text representing a compromise or third approach" }
+  ]
+}
+Do not include markdown code block wrappers. Output only raw JSON.`;
+
+      const userPrompt = `Policy Concern Title: ${concern.title}\nDescription: ${concern.description}\n\nGenerate three options in raw JSON format.`;
+      let generatedText = '';
+
+      if (llmMode === 'webgpu') {
+        generatedText = await LocalLlmRouter.generateWebGpuResponse(systemPrompt, [], userPrompt, {
+          onProgress: (stage, percent) => setMessage(`${stage}: ${percent}%`)
+        });
+      } else {
+        const model = LocalLlmRouter.getOllamaModel();
+        await LocalLlmRouter.ensureOllamaActive(model, (status) => setMessage(status));
+        generatedText = await LocalLlmRouter.generateOllamaResponse(systemPrompt, [], userPrompt);
+      }
+
+      // Parse JSON options
+      let parsed: any = null;
+      try {
+        const cleanedText = generatedText.trim().replace(/^```json/, '').replace(/```$/, '').trim();
+        parsed = JSON.parse(cleanedText);
+      } catch {
+        const match = generatedText.match(/\{[\s\S]*\}/);
+        if (match) {
+          try { parsed = JSON.parse(match[0]); } catch {}
+        }
+      }
+
+      if (!parsed || !Array.isArray(parsed.options)) {
+        throw new Error('Local AI failed to produce structured JSON options. Please retry.');
+      }
+
+      const { collection, addDoc, serverTimestamp } = await import('firebase/firestore');
+      for (let i = 0; i < Math.min(3, parsed.options.length); i++) {
+        const opt = parsed.options[i];
+        await addDoc(collection(db, 'drafts'), {
+          draftId: Math.random().toString(36).substring(2, 11),
+          concernId: id,
+          version: 1,
+          text: `# Option ${opt.label || String.fromCharCode(65 + i)}\n\n${opt.text}`,
+          authors: [{ uid: user?.uid || 'local', role: 'author' }],
+          modelMeta: {
+            model: llmMode === 'webgpu' ? LocalLlmRouter.getWebGpuModel() : LocalLlmRouter.getOllamaModel(),
+            mode: llmMode
+          },
+          status: 'drafting',
+          citations: [],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+      }
+
+      setMessage('Draft options generated successfully!');
+      await loadDraftsAndReadiness(id);
+    } catch(e:any) { 
+      setMessage(e.message || 'Error generating drafts locally.'); 
+    }
     setGenerating(false);
   }
 
   async function sendChat() {
-    if (!id || !chatInput || chatBusy) return;
+  if (!id || !chatInput || chatBusy) { return; }
     const userText = chatInput;
     setChatInput('');
     setChatMessages(msgs => [...msgs, { role: 'user', text: userText }]);
@@ -99,7 +190,7 @@ export default function ConcernDetailPage() {
       setChatMessages(msgs => [...msgs, { role: 'assistant', text: resp.reply, actions: resp.actions }]);
       // Auto-suggest scroll to bottom
       setTimeout(()=> {
-        const el = document.getElementById('chatScroll'); if (el) el.scrollTop = el.scrollHeight;
+  const el = document.getElementById('chatScroll'); if (el) { el.scrollTop = el.scrollHeight; }
       }, 30);
     } catch (e:any) {
       setChatMessages(msgs => [...msgs, { role: 'assistant', text: 'Assistant unavailable. Try again soon.' }]);
@@ -112,6 +203,7 @@ export default function ConcernDetailPage() {
 
   return (
     <div className="space-y-6">
+      <FallbackBanner />
       <div>
         <h1 className="text-2xl font-semibold mb-2">{concern.title}</h1>
   <p className="text-muted whitespace-pre-wrap text-sm">{concern.description}</p>
@@ -142,10 +234,18 @@ export default function ConcernDetailPage() {
         )}
       </div>
       <section className="space-y-3">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <h2 className="text-lg font-medium">Draft Options</h2>
           {user && <button disabled={generating} onClick={regenerate} className="btn-secondary text-xs disabled:opacity-50 min-h-[30px]">{generating? 'Generating…' : (drafts.length? 'Regenerate' : 'Generate')}</button>}
-          {user && drafts.length >= 2 && <Link href={`/ballots/new?concern=${id}`} className="text-xs underline text-brand-teal">Open Ballot</Link>}
+          {user && drafts.length >= 2 && (
+            (readiness && readiness.score >= 60) || (concern.nominationCount >= 10) ? (
+              <Link href={`/ballots/new?concern=${id}`} className="text-xs underline text-brand-teal font-bold">Open Ballot</Link>
+            ) : (
+              <span className="text-[10px] px-2 py-1 rounded bg-amber-100 text-amber-700" title="Improve readiness score to 60+ OR gather 10+ nominations to bypass expert gating">Needs Verification (Score &lt; 60 &amp; Nominations &lt; 10)</span>
+            )
+          )}
+          {readinessLoading && <span className="text-[10px] text-muted animate-pulse">Scoring…</span>}
+          {readiness && !readinessLoading && <button onClick={()=> id && loadDraftsAndReadiness(id)} className="text-[10px] underline">Refresh</button>}
         </div>
   {drafts.length === 0 && <p className="text-xs text-muted">No drafts yet. {user? 'Click Generate to create initial options.' : 'Sign in to generate drafts.'}</p>}
         <div className="space-y-3">
@@ -159,6 +259,108 @@ export default function ConcernDetailPage() {
         </div>
   {message && <p className="text-[11px] text-muted">{message}</p>}
       </section>
+      <section className="space-y-3">
+        {/* Readiness Panel */}
+        {user && (
+          <div className="border rounded-lg p-4 bg-white/60 backdrop-blur shadow-sm space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Readiness Score</h3>
+              {readiness && <span className="text-xs font-mono px-2 py-1 rounded bg-black/10">{readiness.score}</span>}
+            </div>
+            {!readiness && !readinessLoading && <p className="text-[11px] text-muted">Sign in or generate drafts to evaluate readiness.</p>}
+            {readiness && (
+              <div className="space-y-2">
+                <div className="w-full h-2 rounded bg-black/10 overflow-hidden">
+                  <div className={`h-full transition-all duration-500 ${readiness.score>=70?'bg-brand-teal':readiness.score>=50?'bg-amber-500':'bg-red-500'}`} style={{ width: `${readiness.score}%` }} />
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[10px]">
+                  {Object.entries(readiness.components||{}).map(([k,v]:any)=> (
+                    <div key={k} className="flex items-center justify-between px-2 py-1 rounded bg-black/5">
+                      <span className="capitalize">{k}</span><span className="font-mono">{v}</span>
+                    </div>
+                  ))}
+                </div>
+                {readiness.missing && readiness.missing.length>0 && (
+                  <div className="text-[10px] space-y-1">
+                    <p className="font-semibold">Needs:</p>
+                    <ul className="list-disc ml-4 space-y-0.5">
+                      {readiness.missing.map((m:string)=> <li key={m}>{m.replace(/_/g,' ')}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {readiness.recommendations && readiness.recommendations.length>0 && (
+                  <div className="text-[10px] space-y-1">
+                    <p className="font-semibold">Recommendations:</p>
+                    <ul className="list-disc ml-4 space-y-0.5">
+                      {readiness.recommendations.map((r:string,i:number)=> <li key={i}>{r}</li>)}
+                    </ul>
+                  </div>
+                )}
+                <div className="text-[10px] text-muted">Score estimates launch readiness; threshold 60+ suggested. Real-time, recalculates on refresh.</div>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+      {/* Structure Editing Panel */}
+      {user && concern && (
+        <section className="space-y-3">
+          <div className="border rounded-lg p-4 bg-white/70 backdrop-blur shadow-sm space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Policy Structure</h3>
+              <div className="flex items-center gap-2">
+                <button disabled={structureSuggesting || structureSaving} onClick={async ()=> {
+                  if (!id || structureSuggesting) return;
+                  setStructureSuggesting(true);
+                  try {
+                    // Build minimal messages context: use first few chat messages or fallback to concern description
+                    let msgs = chatMessages.slice(-8);
+                    if (msgs.length === 0 && concern?.description) {
+                      msgs = [{ role: 'user', text: concern.description } as any];
+                    }
+                    const title = concern?.title || 'Concern';
+                    const resp = await summarizeConcernSafe({ concernId: id, title, messages: msgs as any });
+                    const summary = resp?.summary || {};
+                    // Apply only where user has not already entered content
+                    if (!structObjectives.trim() && Array.isArray(summary.objectives)) {
+                      setStructObjectives(summary.objectives.slice(0,8).join('\n'));
+                    }
+                    if (!structConstraints.trim() && Array.isArray(summary.constraints)) {
+                      setStructConstraints(summary.constraints.slice(0,8).join('\n'));
+                    }
+                    if (!structOpenQs.trim() && Array.isArray(summary.openQuestions)) {
+                      setStructOpenQs(summary.openQuestions.slice(0,10).join('\n'));
+                    }
+                  } catch {/* ignore */} finally { setStructureSuggesting(false); }
+                }} className="text-[11px] px-3 py-1 rounded border border-brand-teal text-brand-teal disabled:opacity-40">{structureSuggesting? 'Suggesting…':'Suggest (AI)'}</button>
+                <button disabled={structureSaving} onClick={async ()=> {
+                if (!id) return;
+                setStructureSaving(true);
+                try {
+                  await updateConcernStructureSafe({ concernId: id, objectives: structObjectives.split(/\n+/).filter(x=>x.trim()), constraints: structConstraints.split(/\n+/).filter(x=>x.trim()), openQuestions: structOpenQs.split(/\n+/).filter(x=>x.trim()) });
+                  await loadDraftsAndReadiness(id);
+                } catch {/* ignore */} finally { setStructureSaving(false); }
+                }} className="text-[11px] px-3 py-1 rounded bg-brand-teal text-white disabled:opacity-40">{structureSaving? 'Saving…':'Save'}</button>
+              </div>
+            </div>
+            <p className="text-[10px] text-muted">Add one item per line. These improve readiness and guide option refinement.</p>
+            <div className="grid md:grid-cols-3 gap-3">
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] font-semibold">Objectives</label>
+                <textarea value={structObjectives} onChange={e=> setStructObjectives(e.target.value)} placeholder="Clear, desired outcomes..." className="input text-[11px] h-32" />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] font-semibold">Constraints</label>
+                <textarea value={structConstraints} onChange={e=> setStructConstraints(e.target.value)} placeholder="Budget limits, legal bounds..." className="input text-[11px] h-32" />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] font-semibold">Open Questions</label>
+                <textarea value={structOpenQs} onChange={e=> setStructOpenQs(e.target.value)} placeholder="Unknowns to clarify..." className="input text-[11px] h-32" />
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
       <section className="space-y-3">
         <div className="flex items-center gap-3">
           <h2 className="text-lg font-medium">Assistant Chat</h2>
@@ -204,11 +406,11 @@ export default function ConcernDetailPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm animate-fadeIn">
           <div className="bg-white rounded-lg shadow-xl w-full max-w-sm p-5 space-y-4">
             <h3 className="text-sm font-semibold">Assistant Action</h3>
-            {showActionModal.actions.map((a,i)=>(<div key={i} className="text-xs border rounded p-2 bg-black/5">{a.type === 'generate_drafts' ? 'Generate initial draft options for this concern.' : a.label || a.type}</div>))}
+            {showActionModal?.actions?.map((a,i)=>(<div key={i} className="text-xs border rounded p-2 bg-black/5">{a.type === 'generate_drafts' ? 'Generate initial draft options for this concern.' : a.label || a.type}</div>))}
             <div className="flex justify-end gap-2 text-[11px]">
               <button onClick={()=> setShowActionModal(null)} className="px-3 py-1 rounded border">Cancel</button>
               <button onClick={async ()=> {
-                const action = showActionModal.actions[0];
+                const action = showActionModal?.actions?.[0];
                 setShowActionModal(null);
                 if (action?.type === 'generate_drafts' && id) {
                   setGenerating(true); try { await generateDraftsSafe({ concernId: id }); } catch {} setGenerating(false);
@@ -283,6 +485,11 @@ function DraftCard({ draft, user, userTier, refresh }: { draft: any; user: any; 
   }
   const citations = draft.citations || [];
   const reviews = draft.reviews || [];
+  const modelMeta = draft.modelMeta || {};
+  const promptHash = modelMeta.promptHash || draft.provenance?.promptHash;
+  const responseHash = modelMeta.responseHash || draft.provenance?.responseHash;
+  const isFallback = !!modelMeta.fallback || !!draft.provenance?.fallback;
+  const modelName = modelMeta.model || draft.provenance?.modelVersion || 'model?';
   return (
     <article className="card space-y-3">
       <div className="prose prose-sm max-w-none">
@@ -291,6 +498,11 @@ function DraftCard({ draft, user, userTier, refresh }: { draft: any; user: any; 
       <div className="flex flex-wrap gap-3 items-center text-[10px]">
         <span className="px-2 py-1 bg-black/10 rounded">Citations: {citations.length}</span>
         <span className="px-2 py-1 bg-black/10 rounded">Reviews: {reviews.length}</span>
+        <span className={`px-2 py-1 rounded ${isFallback? 'bg-amber-200 text-amber-800':'bg-brand-teal/15 text-brand-teal'}`} title={isFallback? 'Generated via fallback stub (LLM unavailable at generation time)':'Generated by live model'}>
+          {isFallback ? 'Fallback' : modelName}
+        </span>
+        {promptHash && <span className="px-2 py-1 rounded bg-black/5" title={`Prompt hash (first 8): ${String(promptHash).slice(0,12)}`}>ph:{String(promptHash).slice(0,8)}</span>}
+        {responseHash && <span className="px-2 py-1 rounded bg-black/5" title={`Response hash (first 8): ${String(responseHash).slice(0,12)}`}>rh:{String(responseHash).slice(0,8)}</span>}
         {user && <>
           <button onClick={()=> setShowCite(s=>!s)} className="underline">{showCite?'Cancel':'Add Citation'}</button>
           {(['expert','admin'].includes(userTier)) && <button onClick={()=> setShowReview(s=>!s)} className="underline">{showReview?'Cancel':'Add Review'}</button>}

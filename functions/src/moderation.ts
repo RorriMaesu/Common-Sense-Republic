@@ -22,14 +22,15 @@ const PHONE_RE = /(?:(?:\+?\d{1,3}[\s-]?)?(?:\(\d{3}\)|\d{3})[\s-]?\d{3}[\s-]?\d
 // Placeholder disallowed vocabulary list (non-hate, neutral token to avoid policy violations). Extend in future via config/Firestore.
 const DISALLOWED_TERMS = ['forbiddenterm'];
 
-export function moderateAssistantReply(text: string): ModerationResult {
+export function moderateAssistantReply(text: string, customDisallowedTerms?: string[]): ModerationResult {
   const flags: string[] = [];
   if (EMAIL_RE.test(text)) flags.push('pii_email');
   if (PHONE_RE.test(text)) flags.push('pii_phone');
   const lowered = text.toLowerCase();
   let blocked = false;
-  for (const term of DISALLOWED_TERMS) {
-    if (lowered.includes(term)) { flags.push('disallowed_term'); blocked = true; break; }
+  const terms = customDisallowedTerms || DISALLOWED_TERMS;
+  for (const term of terms) {
+    if (lowered.includes(term.toLowerCase())) { flags.push('disallowed_term'); blocked = true; break; }
   }
   // Length sentinel (should already be truncated earlier at ~1800 chars)
   if (text.length > 5000) flags.push('length_excess');

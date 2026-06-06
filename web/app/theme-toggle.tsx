@@ -9,7 +9,7 @@ export default function ThemeToggle() {
     const next = !dark; setDark(next);
     const root = document.documentElement;
     if (next) root.classList.add('dark'); else root.classList.remove('dark');
-    try { localStorage.setItem('wevote-theme', next? 'dark':'light'); } catch {}
+    try { localStorage.setItem('csr-theme', next? 'dark':'light'); } catch {}
   }
   if (!mounted) return <button aria-label="Toggle theme" className="btn-ghost" disabled>…</button>;
   return (

@@ -1,5 +1,6 @@
 import * as admin from 'firebase-admin';
 import * as functions from 'firebase-functions';
+import { getKmsKeyPath } from './runtimeConfig';
 import 'dotenv/config';
 import { createHash } from 'crypto';
 
@@ -21,7 +22,7 @@ async function getKmsClient() {
 export interface KmsSignResult { signatureBase64: string; algo: string; }
 
 export async function kmsSign(data: Buffer): Promise<KmsSignResult | null> {
-  const keyPath = process.env.KMS_KEY_PATH || (functions.config().kms && (functions.config().kms as any).keypath);
+  const keyPath = getKmsKeyPath();
   if (!keyPath) return null;
   try {
     const client = await getKmsClient();

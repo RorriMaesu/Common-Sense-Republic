@@ -1,7 +1,7 @@
 import Link from 'next/link';
 
 export const metadata = {
-  title: 'Contribute — WeVote',
+  title: 'Contribute — Common Sense Republic',
   description: 'Help build an auditable, trustworthy civic drafting and voting platform.'
 };
 
@@ -10,7 +10,7 @@ export default function ContributePage() {
     <div className="space-y-10">
       <section className="space-y-4">
         <h1 className="text-2xl font-semibold tracking-tight">Contribute & Support</h1>
-        <p className="text-sm text-muted max-w-2xl leading-relaxed">WeVote is in active, transparent development. You can accelerate verifiable civic collaboration by contributing code, reviewing security, improving accessibility, or helping cover infrastructure and model costs.</p>
+        <p className="text-sm text-muted max-w-2xl leading-relaxed">Common Sense Republic is in active, transparent development. You can accelerate verifiable civic collaboration by contributing code, reviewing security, improving accessibility, or helping cover infrastructure and model costs.</p>
         <div className="flex flex-wrap gap-3">
           <Link href="/transparency" className="btn-secondary text-xs">Transparency</Link>
           <a href="https://buymeacoffee.com/rorrimaesu" target="_blank" rel="noopener noreferrer" className="btn-primary text-xs">Donate Coffee</a>
@@ -65,7 +65,7 @@ export default function ContributePage() {
       </section>
       <section className="space-y-3">
         <h2 className="font-semibold text-sm">Support Without Coding</h2>
-        <p className="text-[13px] text-muted max-w-xl">Share WeVote with civic technologists, policy researchers, or local community groups; or sponsor infra/model usage with a coffee.</p>
+        <p className="text-[13px] text-muted max-w-xl">Share Common Sense Republic with civic technologists, policy researchers, or local community groups; or sponsor infra/model usage with a coffee.</p>
         <a href="https://buymeacoffee.com/rorrimaesu" target="_blank" rel="noopener noreferrer" className="btn-primary text-xs w-fit">Donate</a>
       </section>
     </div>

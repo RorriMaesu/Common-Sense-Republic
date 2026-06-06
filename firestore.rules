@@ -13,7 +13,10 @@ service cloud.firestore {
     match /concerns/{id} {
       allow read: if true; // public read
       allow create: if isSignedIn();
-      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.authorUid;
+      // Allow updates/deletes by original creator (field createdBy) OR legacy authorUid for backward compatibility.
+      allow update, delete: if isSignedIn() && (
+        request.auth.uid == resource.data.createdBy || request.auth.uid == resource.data.authorUid
+      );
     }
 
     match /drafts/{id} {
