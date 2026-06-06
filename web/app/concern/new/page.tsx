@@ -65,7 +65,7 @@ export default function NewConcernPage() {
     setError(null);
     
     try {
-      const systemPrompt = "You are a friendly, helpful AI Representative for the Common Sense Republic. Your job is to chat with the citizen, listen to their local policy concern, ask clarifying questions to understand the details, and help them formulate a clear policy request. Keep your replies concise and encouraging.";
+      const systemPrompt = "You are a friendly, helpful AI Representative for the Common Sense Republic. Your job is to chat with the citizen, listen to their local policy concern, ask clarifying questions to understand the details, and help them formulate a clear policy request. Keep your replies concise and encouraging. Do not use any markdown formatting symbols (such as asterisks **, lists, headers ###, or horizontal lines ***) in your responses. Output only plain text.";
       const routerHistory: ChatMessage[] = nextMessages.map(m => ({
         role: m.role === 'user' ? 'user' : 'assistant',
         content: m.text
