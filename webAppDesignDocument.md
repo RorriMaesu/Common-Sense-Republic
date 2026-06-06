@@ -107,7 +107,7 @@ Footer: Transparency link, Governance charter, Privacy policy
 
 ### Onboarding (first-time user)
 
-* Step 0: Welcome modal — “WeVote is advisory by design...” CTA: Continue
+* Step 0: Welcome modal — “Common Sense Republic is advisory by design...” CTA: Continue
 * Step 1: Choose display name & region (auto detect + override)
 * Step 2: Quick tutorial: 60s RCV interactive demo (skipable)
 * Step 3: Privacy & verification explanation (how tiers work)

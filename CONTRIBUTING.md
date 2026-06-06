@@ -1,8 +1,8 @@
-# Contributing to WeVote
+# Contributing to Common Sense Republic
 
 First off, thank you for your interest in strengthening trustworthy, auditable civic collaboration.
 
-Repository: https://github.com/RorriMaesu/WeVote
+Repository: https://github.com/RorriMaesu/Common-Sense-Republic
 
 Clone / Fork from the GitHub URL above. Do **not** copy private deployment artifacts (e.g. real `.env`, service account JSON) into PRs. Use `.env.example` placeholders when documenting configuration.
 

@@ -2,7 +2,7 @@
   "name": "wevote-monorepo",
   "repository": {
     "type": "git",
-    "url": "https://github.com/RorriMaesu/WeVote.git"
+    "url": "https://github.com/RorriMaesu/Common-Sense-Republic.git"
   },
   "private": true,
   "workspaces": ["web", "functions", "packages/shared"],

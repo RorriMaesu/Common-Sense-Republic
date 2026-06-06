@@ -33,7 +33,7 @@ export default function AuthPage() {
     <div className="max-w-sm mx-auto card space-y-4">
       <h1 className="text-lg font-semibold">Sign In</h1>
       <button onClick={signIn} className="btn-primary w-full">Continue with Google</button>
-  <p className="text-[11px] text-muted">By signing in you accept the advisory nature of WeVote.</p>
+  <p className="text-[11px] text-muted">By signing in you accept the advisory nature of Common Sense Republic.</p>
     </div>
   );
   return (

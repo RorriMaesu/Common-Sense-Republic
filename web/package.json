@@ -2,7 +2,7 @@
   "name": "common-sense-republic-web",
   "repository": {
     "type": "git",
-    "url": "https://github.com/RorriMaesu/WeVote.git",
+    "url": "https://github.com/RorriMaesu/Common-Sense-Republic.git",
     "directory": "web"
   },
   "version": "0.1.0",
