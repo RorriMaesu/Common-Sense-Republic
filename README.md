@@ -31,7 +31,7 @@ Here is how a citizen concern becomes a fully audited policy recommendation:
 graph TD
     A[Citizen Submits Concern] --> B[Clarifying Chat Assistant]
     B --> C[Structured Summary Generated]
-    C --> D[Gemini Pro Bill Drafting]
+    C --> D[Local AI Bill Drafting]
     D --> E[Expert Legal / Fact Review]
     E --> F[Liquid Voting / RCV Ballot]
     F --> G[Weighted Tally Resolution]
@@ -51,10 +51,27 @@ graph TD
 
 ---
 
+## 🤖 Local-First AI Architecture
+
+Common Sense Republic runs entirely on local, client-side inference to protect citizen privacy, eliminate central hosting/inference costs, and ensure censorship resistance. The application supports two primary routing modes:
+
+### 1. WebGPU In-Browser Inference (LiteRT-LM)
+Run models directly in the user's browser using the WebGPU standard. Models are downloaded once and cached securely in the browser's Origin Private File System (OPFS):
+* **SmolLM2 Ultra-Light (135M):** Under 250MB, runs on budget mobile/desktop environments (requires ~4GB RAM).
+* **Gemma 4 Efficient (2.5B):** Optimally balanced for standard consumer devices.
+* **Gemma 4 Pro (4.5B):** Advanced reasoning and drafting capabilities (requires ~8GB+ RAM).
+
+### 2. Local Ollama Integration
+Connects directly to an Ollama daemon running on the user's local machine (`http://localhost:11434`):
+* **Recommended Model:** `gemma4:e4b` (4.5B parameter instruction model).
+* Offers speculative multi-token prediction (`draft_num_predict`) for fast, local response streams.
+
+---
+
 ## 📁 Monorepo Structure
 
-* [`web/`](file:///d:/aiPolitician/web) – Next.js 14 (App Router) frontend styled with Tailwind CSS.
-* [`functions/`](file:///d:/aiPolitician/functions) – Firebase Cloud Functions (TypeScript) hosting our secure tally and LLM APIs.
+* [`web/`](file:///d:/aiPolitician/web) – Next.js 14 (App Router) frontend styled with Tailwind CSS, hosting the local inference controllers.
+* [`functions/`](file:///d:/aiPolitician/functions) – Firebase Cloud Functions (TypeScript) hosting our secure tally and auditing APIs.
 * [`packages/shared/`](file:///d:/aiPolitician/packages/shared) – Pure TypeScript modules, including the deterministic Ranked-Choice Voting (RCV) tally algorithm.
 
 ---
@@ -64,7 +81,7 @@ graph TD
 ### Prerequisites
 * Node.js 18+ (Node 20 recommended)
 * Firebase CLI
-* Gemini API Key
+* (Optional) [Ollama](https://ollama.com) installed for desktop background inference.
 
 ### Local Installation
 
@@ -85,24 +102,36 @@ graph TD
    ```
 
 2. **Configure local environment variables:**
-   Create a `.env` file in the `functions/` directory:
+   Create a `.env` file in the `functions/` directory for local developer testing:
    ```env
-   GEMINI_API_KEY=your_api_key_here
    RECEIPTS_SECRET=local-dev-secret
    ```
 
-3. **Start the Firebase Emulators:**
+3. **Pull the Ollama model (if using Ollama mode):**
+   ```bash
+   ollama pull gemma4:e4b
+   ```
+
+4. **Start the Firebase Emulators:**
    ```bash
    cd functions
    npm run serve
    ```
 
-4. **Run the Next.js development server:**
+5. **Run the Next.js development server:**
    ```bash
    cd ../web
    npm run dev
    ```
    Open [http://localhost:3000](http://localhost:3000) to view the application.
+
+---
+
+## ☕ Support the Project
+
+If you believe in direct digital democracy and want to help support our hosting costs, consider buying us a coffee!
+
+<a href="https://buymeacoffee.com/rorrimaesu" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
 ---
 
@@ -112,11 +141,11 @@ We are building a movement to change how society governs itself. We welcome cont
 
 ### 💻 For Developers
 * Check out the [Roadmap](#-roadmap-high-priority-tasks) below and pick up open tasks.
-* Optimize our client-side ledger verification page or help integrate streaming LLM responses.
-* Help port our models to run locally (e.g., using Ollama or Gemma 2) to eliminate external API dependencies entirely.
+* Optimize our client-side WebGPU loading states or help implement fine-tuned local models.
+* Standardize local system prompts and help port the ledger check UI to Next.js App Router templates.
 
 ### ⚖️ For Policy & Legal Experts
-* Help refine the **Expert Review Pipeline** prompt templates.
+* Help refine the local prompt schemas used for synthesis and drafting.
 * Assist in drafting the guidelines for the Community Governance Board.
 
 ### 📢 For Community Organizers
@@ -132,9 +161,9 @@ Please read our [Contributing Guide](file:///d:/aiPolitician/CONTRIBUTING.md) to
 - [x] Weighted Liquid Democracy delegation traversal in tally engine
 - [x] Transparent RCV tie-breakers using options creation order
 - [x] Dynamic Firestore moderation vocabulary loading
-- [ ] RAG ingestion pipeline + Pro drafting flow (citations, provenance expansion)
+- [x] Local-first WebGPU (LiteRT-LM) and Ollama integration
+- [ ] Ingestion pipelines for municipal code (citations and local law RAG integration)
 - [ ] CI/CD GitHub Actions pipeline (lint, test, deploy staging)
-- [ ] Port assistant to run fully local open-weights models (Gemma)
 - [ ] Streaming assistant responses (progressive render)
 - [ ] Advanced editor suggestion mode & version diff viewer
 
@@ -149,7 +178,7 @@ Please read our [Contributing Guide](file:///d:/aiPolitician/CONTRIBUTING.md) to
 
 | Domain | Status | Notes |
 |--------|--------|-------|
-| Draft Generation | ✅ | Caching via `(concernId + promptHash)` |
+| Draft Generation | ✅ | Client-controlled local model routing |
 | Voting (simple, approval, RCV) | ✅ | Deterministic options-order tie-break |
 | Vote Receipts | ✅ | HMAC-SHA256 truncated to 32 hex + short code |
 | Transparency Ledger | ✅ | Append-only hash chain (`transparency_ledger`) |
@@ -157,40 +186,16 @@ Please read our [Contributing Guide](file:///d:/aiPolitician/CONTRIBUTING.md) to
 | Receipt Verification | ✅ | Non-identifying vote proof |
 | Rate Limits | ✅ | Drafts (10/hr), Ballots (3/6h), Votes (10/hr) |
 
-### Gemini API Key & Model Configuration
-The draft generation functions look up the Gemini key in this order:
-1. `functions.config().gemini.key` (Firebase Functions runtime config – production)
-2. `process.env.GEMINI_API_KEY` (environment variable – local/emulator fallback)
-
-#### Set Key in Firebase (Production)
-```bash
-firebase functions:config:set gemini.key="YOUR_GEMINI_API_KEY"
-firebase deploy --only functions
-```
-
-#### Model Variant Tier Mapping
-* **Basic:** `gemini-2.5-flash-lite`
-* **Verified:** `gemini-2.5-flash`
-* **Expert/Admin:** `gemini-2.5-pro`
-
 ### Troubleshooting & Logs
 
 | Symptom | Likely Cause | Resolution |
 |---------|--------------|-----------|
 | Frontend not showing new functions | Hosting not redeployed | Run full deploy including Hosting |
 | Missing signatures in ledger | KMS key not configured | Configure `kms.keypath` or ignore (optional) |
-| Repeated draft creation for same prompt | Caching bypassed due to prompt change | Confirm stable prompt template & hashing |
+| WebGPU fails to load | Browser WebGPU not enabled / incompatible hardware | Open local settings in header and select Ollama mode |
 
 To view detailed server errors, check the Firebase Console -> Functions -> Logs.
 </details>
-
----
-
-## ☕ Support the Project
-
-If you believe in direct digital democracy and want to help support our hosting and API model costs, consider buying us a coffee!
-
-<a href="https://buymeacoffee.com/rorrimaesu" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
 ---
 
